@@ -1,0 +1,39 @@
+=======================================================
+City : Aosta
+Query: Aosta, Aosta, Italy
+Loading graph...
+Graph loaded: 823 nodes, 1,717 edges
+  Run  1/10 | Iterations:    291 | Plot saved: plots/dijkstra_run01_aosta.png
+  Run  2/10 | Iterations:      3 | Plot saved: plots/dijkstra_run02_aosta.png
+  Run  3/10 | Iterations:    775 | Plot saved: plots/dijkstra_run03_aosta.png
+  Run  4/10 | Iterations:    278 | Plot saved: plots/dijkstra_run04_aosta.png
+  Run  5/10 | Iterations:    786 | Plot saved: plots/dijkstra_run05_aosta.png
+  Run  6/10 | Iterations:    713 | Plot saved: plots/dijkstra_run06_aosta.png
+  Run  7/10 | Iterations:     11 | Plot saved: plots/dijkstra_run07_aosta.png
+  Run  8/10 | Iterations:    739 | Plot saved: plots/dijkstra_run08_aosta.png
+  Run  9/10 | Iterations:    495 | Plot saved: plots/dijkstra_run09_aosta.png
+  Run 10/10 | Iterations:    137 | Plot saved: plots/dijkstra_run10_aosta.png
+
+  Steps per run : [291, 3, 775, 278, 786, 713, 11, 739, 495, 137]
+  Average steps : 422.8
+  Heatmap saved : plots/dijkstra_heatmap_aosta.png
+
+=======================================================
+City : Turin
+Query: Turin, Piedmont, Italy
+Loading graph...
+Graph loaded: 76,483 nodes, 166,951 edges
+  Run  1/10 | Iterations:  32530 | Plot saved: plots/dijkstra_run01_turin.png
+  Run  2/10 | Iterations:   5656 | Plot saved: plots/dijkstra_run02_turin.png
+  Run  3/10 | Iterations:  65458 | Plot saved: plots/dijkstra_run03_turin.png
+  Run  4/10 | Iterations:  65024 | Plot saved: plots/dijkstra_run04_turin.png
+  Run  5/10 | Iterations:  32135 | Plot saved: plots/dijkstra_run05_turin.png
+  Run  6/10 | Iterations:  29361 | Plot saved: plots/dijkstra_run06_turin.png
+  Run  7/10 | Iterations:  66945 | Plot saved: plots/dijkstra_run07_turin.png
+  Run  8/10 | Iterations:  30853 | Plot saved: plots/dijkstra_run08_turin.png
+  Run  9/10 | Iterations:  63591 | Plot saved: plots/dijkstra_run09_turin.png
+  Run 10/10 | Iterations:  34708 | Plot saved: plots/dijkstra_run10_turin.png
+
+  Steps per run : [32530, 5656, 65458, 65024, 32135, 29361, 66945, 30853, 63591, 34708]
+  Average steps : 42626.1
+  Heatmap saved : plots/dijkstra_heatmap_turin.png
