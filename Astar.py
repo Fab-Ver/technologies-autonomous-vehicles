@@ -50,6 +50,7 @@ HEURISTICS = {
 }
 
 def astar(G, orig, dest, heuristic, max_speed=1):
+    """Run A* algorithm from orig to dest using the provided heuristic function, return number of iterations."""
     reset_graph(G)
     G.nodes[orig]["distance"] = 0
     G.nodes[orig]["size"] = 50
@@ -139,18 +140,19 @@ def main():
                 steps = astar(G, start, end, h_func, max_speed=max_speed)
                 if steps is None:
                     print(f"    Run {i:2d}/{num_runs} | WARNING: no path found for this pair")
-                    run_results.append({"iterations": None, "distance_km": None})
+                    run_results.append({"iterations": None, "distance_km": None, "travel_time_s": None})
                     continue
                 city_acronym = "A" + city_name[:2].upper() + h_name[:3].upper()
                 fp = f"plots/astar/{city_abbr}/{h_name}/run{i:02d}_{city_acronym}.png"
-                dist = reconstruct_path(G, start, end, plot=True, algorithm="astar", filepath=fp)
-                run_results.append({"iterations": steps, "distance_km": round(dist, 4)})
-                print(f"    Run {i:2d}/{num_runs} | Iterations: {steps:6d} | Distance: {dist:.2f} km | Plot saved: {fp}")
+                dist, travel_time = reconstruct_path(G, start, end, plot=True, algorithm="astar", filepath=fp)
+                run_results.append({"iterations": steps, "distance_km": round(dist, 4), "travel_time_s": round(travel_time, 2)})
+                print(f"    Run {i:2d}/{num_runs} | Iterations: {steps:6d} | Distance: {dist:.2f} km | Time: {travel_time:.1f} s | Plot saved: {fp}")
 
             valid = [r for r in run_results if r["iterations"] is not None]
             avg = sum(r["iterations"] for r in valid) / len(valid) if valid else 0
-            print(f"\n    Steps per run : {[r['iterations'] for r in run_results]}")
-            print(f"    Average steps : {avg:.1f}")
+            print(f"\n    Steps per run       : {[r['iterations'] for r in run_results]}")
+            print(f"    Travel times (s)    : {[r['travel_time_s'] for r in run_results]}")
+            print(f"    Average steps       : {avg:.1f}")
 
             # Update results for this city/heuristic
             all_results[city_name]["results"][f"astar_{h_name}"] = {

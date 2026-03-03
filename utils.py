@@ -18,7 +18,7 @@ def get_global_max_speed(G):
     for u, v, data in G.edges(data=True):
         if "maxspeed" in data and data["maxspeed"] > max_speed:
             max_speed = data["maxspeed"]
-    return max_speed
+    return max_speed / 3.6  # convert km/h to m/s
 
 def compute_weights(G):
     """Compute the "weight" attribute for each edge based on its length and maxspeed."""
@@ -38,7 +38,8 @@ def compute_weights(G):
                     maxspeed = int(maxspeed.split()[0])
         G.edges[edge]["maxspeed"] = maxspeed
         # Adding the "weight" attribute (time = distance / speed)
-        G.edges[edge]["weight"] = G.edges[edge]["length"] / maxspeed
+        maxspeed_ms = maxspeed * 1000 / 3600  # convert km/h to m/s
+        G.edges[edge]["weight"] = G.edges[edge]["length"] / maxspeed_ms 
 
 def style_unvisited_edge(G, edge):        
     G.edges[edge]["color"] = "gray"
@@ -64,10 +65,12 @@ def reconstruct_path(G, orig, dest, plot=False, algorithm=None, filepath=None):
     for edge in G.edges:
         style_unvisited_edge(G, edge)
     dist = 0
+    travel_time = 0
     curr = dest
     while curr != orig:
         prev = G.nodes[curr]["previous"]
         dist += G.edges[(prev, curr, 0)]["length"]
+        travel_time += G.edges[(prev, curr, 0)]["weight"]
         style_path_edge(G, (prev, curr, 0))
         if algorithm:
             G.edges[(prev, curr, 0)][f"{algorithm}_uses"] = G.edges[(prev, curr, 0)].get(f"{algorithm}_uses", 0) + 1
@@ -75,7 +78,7 @@ def reconstruct_path(G, orig, dest, plot=False, algorithm=None, filepath=None):
     dist /= 1000
     if plot:
         plot_graph(G, filepath=filepath)
-    return dist
+    return dist, travel_time
 
 def plot_graph(G, filepath=None):
     os.makedirs(os.path.dirname(filepath), exist_ok=True) if filepath else None

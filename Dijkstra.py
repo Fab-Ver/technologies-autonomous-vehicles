@@ -91,16 +91,17 @@ def main():
                 run_results.append(steps)
                 city_acronym = "D" + city_name[:2].upper()
                 fp = f"plots/dijkstra/{city_abbr}/run{i:02d}_{city_acronym}.png"
-                dist = reconstruct_path(G, start, end, plot=True, filepath=fp)
-                run_results[-1] = {"iterations": steps, "distance_km": round(dist, 4)}
-                print(f"    Run {i:2d}/{num_runs} | Iterations: {steps:6d} | Distance: {dist:.2f} km | Plot saved: {fp}")
+                dist, travel_time = reconstruct_path(G, start, end, plot=True, filepath=fp)
+                run_results[-1] = {"iterations": steps, "distance_km": round(dist, 4), "travel_time_s": round(travel_time, 2)}
+                print(f"    Run {i:2d}/{num_runs} | Iterations: {steps:6d} | Distance: {dist:.2f} km | Time: {travel_time:.1f} s | Plot saved: {fp}")
             else:
                 print(f"    Run {i+1:2d}/{num_runs} | No path found, retrying...")
 
         avg = sum(r["iterations"] for r in run_results) / len(run_results)
-        print(f"\n    Steps per run : {[r['iterations'] for r in run_results]}")
-        print(f"    Avg distance  : {sum(r['distance_km'] for r in run_results) / len(run_results):.2f} km")
-        print(f"    Average steps : {avg:.1f}")
+        print(f"\n    Steps per run       : {[r['iterations'] for r in run_results]}")
+        print(f"    Avg distance        : {sum(r['distance_km'] for r in run_results) / len(run_results):.2f} km")
+        print(f"    Avg travel time (s) : {sum(r['travel_time_s'] for r in run_results) / len(run_results):.1f} s")
+        print(f"    Average steps       : {avg:.1f}")
 
         # Save valid pairs for A* reuse
         pairs_fp = f"results/pairs_{city_abbr}.json"
