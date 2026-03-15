@@ -87,23 +87,22 @@ The results are then discussed in relation to graph size and heuristic choice, w
 \subsection{Graph Construction}
 
 Road networks are obtained from OpenStreetMap using the \texttt{osmnx} library.
-For each city, a directed multigraph is constructed by querying the city's administrative boundary with \texttt{network\_type="drive"}, so that only road segments accessible to motor vehicles are included.
-Each node represents a road junction and stores geographic coordinates (longitude and latitude), while each directed edge represents a road segment with attributes such as \texttt{length} (in metres) and \texttt{maxspeed} (in km/h).
+For each city, a directed multigraph is constructed, each node represents a road junction and stores geographic coordinates (longitude and latitude), while each directed edge represents a road segment with attributes such as \texttt{length} (in metres) and \texttt{maxspeed} (in km/h).
 
 \subsection{Edge Weight Computation}
 
 The weight assigned to each edge models travel time rather than physical distance, as travel time is a more practical optimization criterion for vehicle routing.
 The weight assigned to each edge is:
 \[
-  w(e) = \frac{\ell(e)}{v_{\max}^{\text{m/s}}(e)}
+  w(e) = \frac{\ell(e)}{v_{\max}(e)}
 \]
-where $\ell(e)$ is the length of edge $e$ in metres and $v_{\max}^{\text{m/s}}(e)$ is the posted speed limit converted to m/s.
+where $\ell(e)$ is the length of edge $e$ in metres and $v_{\max}(e)$ is the posted speed limit converted to m/s.
 The resulting weight equals the true travel time $t(e)$ in seconds; the algorithm therefore minimizes total travel time directly.
 For edges where no speed limit is recorded in OpenStreetMap, a default value of 40~km/h is assumed.
 
 \subsection{Dijkstra's Algorithm}
 
-Dijkstra's algorithm is implemented using a binary min-heap (\texttt{heapq}) as the priority queue.
+Dijkstra's algorithm is implemented using a binary min-heap as the priority queue.
 Each node maintains a \texttt{distance} label, initialized to $+\infty$ except for the source, which is set to 0.
 At each iteration, the node with the smallest tentative distance is extracted; if it has already been marked as visited, it is skipped; otherwise, all outgoing neighbors are relaxed.
 The algorithm terminates as soon as the destination node is extracted from the queue, guaranteeing optimality on graphs with non-negative edge weights.
@@ -117,12 +116,6 @@ The priority of each node in the queue is:
   f(n) = g(n) + h(n)
 \]
 where $g(n)$ is the exact travel-time cost accumulated from the source to $n$.
-To ensure dimensional consistency between $g(n)$ and $h(n)$, each distance-based heuristic estimate is normalized by the maximum speed limit $v_{\max}^{\star}$ observed in the graph:
-\[
-  h(n) = \frac{d(n,\, \text{dest})}{v_{\max}^{\star}}
-\]
-For the Euclidean and Haversine variants, this normalization guarantees both admissibility and consistency: since any road path between two nodes is at least as long as the straight-line distance between them, dividing the straight-line estimate by $v_{\max}^{\star}$ yields a lower bound on the remaining travel time; furthermore, geometric distances satisfy the triangle inequality, which ensures the consistency condition required for optimality in graph-search A* (where visited nodes are not re-expanded).
-The Manhattan variant satisfies $d_{\text{Man}} \geq d_{\text{Euc}}$ and therefore does not carry a formal admissibility guarantee.
 Three functions are used to compute the geometric distance $d$:
 
 \begin{itemize}
@@ -144,6 +137,14 @@ Three functions are used to compute the geometric distance $d$:
   \end{align*}
   The computation is delegated to \texttt{ox.distance.great\_circle}, which operates on geographic (lat/lon) coordinates.
 \end{itemize}
+
+To ensure dimensional consistency between $g(n)$ and $h(n)$, each distance-based heuristic estimate is normalized by the maximum speed limit $v_{\max}^{\star}$ observed in the graph:
+\[
+  h(n) = \frac{d(n,\, \text{dest})}{v_{\max}^{\star}}
+\]
+For the Euclidean and Haversine variants, this normalization guarantees admissibility: since any road path between two nodes is at least as long as the straight-line distance between them, dividing the straight-line estimate by $v_{\max}^{\star}$ yields a lower bound on the remaining travel time.
+The Manhattan variant satisfies $d_{\text{Man}} \geq d_{\text{Euc}}$ and therefore does not carry a formal admissibility guarantee.
+
 
 All three variants were first evaluated on the original unprojected graph (geographic coordinates in decimal degrees), sharing the same min-heap structure, early-termination condition, and visited-node logic as the Dijkstra implementation.
 For the Haversine variant this is correct by design: \texttt{ox.distance.great\_circle} accepts latitude and longitude and always returns a distance in metres, placing $h(n)$ on the same scale as the edge weights.
