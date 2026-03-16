@@ -146,16 +146,17 @@ For the Euclidean and Haversine variants, this normalization guarantees admissib
 The Manhattan variant satisfies $d_{\text{Man}} \geq d_{\text{Euc}}$ and therefore does not carry a formal admissibility guarantee.
 
 
-All three variants were first evaluated on the original unprojected graph (geographic coordinates in decimal degrees), sharing the same min-heap structure, early-termination condition, and visited-node logic as the Dijkstra implementation.
-For the Haversine variant this is correct by design: \texttt{ox.distance.great\_circle} accepts latitude and longitude and always returns a distance in metres, placing $h(n)$ on the same scale as the edge weights.
-For the Manhattan and Euclidean variants, however, distances are computed directly from latitude and longitude differences, which lie in the range $10^{-3}$--$10^{-2}$ degrees for typical city-scale paths.
-After normalization by $v_{\max}^{\star}$ (in m/s), these values are several orders of magnitude smaller than the accumulated $g(n)$ terms, making $h(n) \approx 0$ and causing A* to explore nodes in the same order as Dijkstra.
+All three variants share the same min-heap structure, early-termination condition, and visited-node logic as the Dijkstra implementation.
 
-To examine how the choice of coordinate system affects heuristic quality, the Manhattan and Euclidean variants were additionally evaluated on a projected version of the graph.
-A projected graph is obtained by converting the original geographic coordinates, expressed in decimal degrees of longitude and latitude, to a planar metric coordinate reference system (CRS).
-Concretely, \texttt{ox.project\_graph} projects all node coordinates to the appropriate local UTM zone, replacing degree-based values with positions in metres, edge lengths are recalculated in the new coordinate system.
-On the projected graph, the $x$ and $y$ coordinate differences used by the Manhattan and Euclidean functions are in metres, placing $h(n)$ on the same scale as the edge weights after normalization by $v_{\max}^{\star}$.
-The effect of this coordinate conversion on the number of iterations is evaluated in Section~\ref{sec:results_aosta}.
+To ensure that the heuristics $h(n)$ are on the same scale as the accumulated edge weights $g(n)$ (in seconds), the geometric distances must be computed in metres before being normalized by $v_{\max}^{\star}$.
+For the Haversine variant, this is handled natively: \texttt{ox.distance.great\_circle} accepts geographic coordinates (latitude and longitude in decimal degrees) and always returns a distance in metres.
+For the Manhattan and Euclidean variants, however, computing distances directly from latitude and longitude differences would yield values in degrees ($10^{-3}$--$10^{-2}$), which become negligible after normalization, effectively causing A* to degenerate to Dijkstra's algorithm.
+
+To resolve this, the Manhattan and Euclidean variants are evaluated on a projected version of the graph.
+A projected graph is obtained by converting the original geographic coordinates to a planar metric coordinate reference system (CRS).
+Concretely, \texttt{ox.project\_graph} projects all node coordinates to the appropriate local UTM zone, replacing degree-based values with positions in metres; as a side effect, edge lengths are recalculated in the new coordinate system.
+On the projected graph, the $x$ and $y$ coordinate differences used by the Manhattan and Euclidean functions are correctly expressed in metres.
+The effect of this coordinate projection on algorithm performance is evaluated in Section~\ref{sec:results_aosta}.
 
 \section{Experiments}
 
@@ -201,37 +202,34 @@ The average number of iterations over the ten runs is used as the summary statis
 
 \subsection{Aosta}\label{sec:results_aosta}
 
-Table~\ref{tab:results_aosta} reports the number of iterations per run for all six algorithm configurations on the Aosta network.
-The unprojected Manhattan and Euclidean variants produce iteration counts identical to Dijkstra, since their heuristic values are negligible when computed from geographic coordinates (Section~\ref{sec:astar_design}).
-The projected variants and Haversine all reduce the number of iterations meaningfully: projected Manhattan achieves the largest reduction, while projected Euclidean and Haversine perform similarly.
-Paths and travel times are identical across all algorithms and runs, with one exception: on run~9, A* Manhattan (projected) found a suboptimal path (2.8683~km, 226.40~s) compared to the optimal solution found by all other variants (2.8811~km, 222.97~s), marked with~$^\dagger$ in the table.
+Table~\ref{tab:results_aosta} reports the number of iterations per run for the four algorithm configurations on the Aosta network.
+The A* variants all reduce the number of iterations meaningfully compared to Dijkstra: Manhattan achieves the largest reduction, while Euclidean and Haversine perform similarly.
+Paths and travel times are identical across all algorithms and runs, with one exception: on run~9, A* Manhattan found a suboptimal path (2.8683~km, 226.40~s) compared to the optimal solution found by all other variants (2.8811~km, 222.97~s), marked with~$^\dagger$ in the table.
 Figure~\ref{fig:paths_aosta} shows the paths produced on run~9, chosen as the representative example since it exhibits this divergence.
 
 \begin{table}[H]
   \centering
   \small
   \setlength{\tabcolsep}{5pt}
-  \begin{tabular}{crrrrrrrr}
+  \begin{tabular}{crrrrrr}
     \toprule
-    \textbf{Run} & \textbf{Dijkstra} & \textbf{Man.} & \textbf{Man.-P} & \textbf{Euc.} & \textbf{Euc.-P} & \textbf{Hav.} & \textbf{Dist.~(km)} & \textbf{Time~(s)} \\
+    \textbf{Run} & \textbf{Dijkstra} & \textbf{Manhattan} & \textbf{Euclidean} & \textbf{Haversine} & \textbf{Dist.~(km)} & \textbf{Time~(s)} \\
     \midrule
-    1  & 189 & 189 &   69 & 189 &  87 &  87 & 1.1034 & 112.11 \\
-    2  & 425 & 425 &  170 & 425 & 244 & 244 & 1.6301 & 182.85 \\
-    3  & 615 & 615 &  220 & 615 & 269 & 269 & 2.6132 & 240.84 \\
-    4  & 252 & 252 &   27 & 252 &  44 &  44 & 1.0240 & 104.38 \\
-    5  & 748 & 748 &  433 & 748 & 569 & 569 & 5.0599 & 410.44 \\
-    6  & 761 & 761 &  577 & 761 & 628 & 628 & 4.0024 & 355.85 \\
-    7  & 106 & 106 &   13 & 106 &  13 &  14 & 0.9574 &  68.93 \\
-    8  & 288 & 288 &   76 & 288 & 108 & 108 & 1.5966 & 141.76 \\
-    9  & 633 & 633 & $55^\dagger$ & 633 & 133 & 133 & 2.8811 & 222.97 \\
-    10 &  23 &  23 &   14 &  23 &  16 &  16 & 0.6414 &  54.49 \\
+    1  & 189 &   69 &  87 &  87 & 1.1034 & 112.11 \\
+    2  & 425 &  170 & 244 & 244 & 1.6301 & 182.85 \\
+    3  & 615 &  220 & 269 & 269 & 2.6132 & 240.84 \\
+    4  & 252 &   27 &  44 &  44 & 1.0240 & 104.38 \\
+    5  & 748 &  433 & 569 & 569 & 5.0599 & 410.44 \\
+    6  & 761 &  577 & 628 & 628 & 4.0024 & 355.85 \\
+    7  & 106 &   13 &  13 &  14 & 0.9574 &  68.93 \\
+    8  & 288 &   76 & 108 & 108 & 1.5966 & 141.76 \\
+    9  & 633 & $55^\dagger$ & 133 & 133 & 2.8811 & 222.97 \\
+    10 &  23 &   14 &  16 &  16 & 0.6414 &  54.49 \\
     \midrule
-    \textbf{Avg}   & 404.0 & 404.0 &  165.4 & 404.0 & 211.1 & 211.2 & & \\
-    \textbf{Impr.} & ---   & $0\%$ & $-59.1\%$ & $0\%$ & $-47.7\%$ & $-47.7\%$ & & \\
+    \textbf{Avg}   & 404.0 &  165.4 & 211.1 & 211.2 & & \\
+    \textbf{Impr.} & ---   & $-59.1\%$ & $-47.7\%$ & $-47.7\%$ & & \\
     \bottomrule
   \end{tabular}
-  \vspace{3pt}
-  {\footnotesize $^\dagger$A* Manhattan (projected) on run~9 found a suboptimal path: 2.8683~km, 226.40~s (vs.\ optimal 2.8811~km, 222.97~s).}
   \caption{Iterations per run and average improvement over Dijkstra - Aosta (825~nodes, 1\,723~edges). Dist.\ and Time refer to the optimal path found by Dijkstra and all admissible variants; $^\dagger$ marks a suboptimal result.}
   \label{tab:results_aosta}
 \end{table}
@@ -241,62 +239,53 @@ Figure~\ref{fig:paths_aosta} shows the paths produced on run~9, chosen as the re
   \begin{subfigure}[b]{0.30\textwidth}
     \includegraphics[width=\textwidth]{../plots/dijkstra/aosta/run09_DAO.png}
     \caption{Dijkstra}
-  \end{subfigure}\hfill
+  \end{subfigure}\hspace{1cm}
   \begin{subfigure}[b]{0.30\textwidth}
     \includegraphics[width=\textwidth]{../plots/astar/aosta/manhattan/run09_AAOMANHAT.png}
     \caption{A* Manhattan}
-  \end{subfigure}\hfill
-  \begin{subfigure}[b]{0.30\textwidth}
-    \includegraphics[width=\textwidth]{../plots/astar/aosta/manhattan_projected/run09_AAOMANHAT.png}
-    \caption{A* Manhattan-P $^\dagger$}
   \end{subfigure}
 
   \medskip
-
+  
   \begin{subfigure}[b]{0.30\textwidth}
     \includegraphics[width=\textwidth]{../plots/astar/aosta/euclidean/run09_AAOEUCLID.png}
     \caption{A* Euclidean}
-  \end{subfigure}\hfill
-  \begin{subfigure}[b]{0.30\textwidth}
-    \includegraphics[width=\textwidth]{../plots/astar/aosta/euclidean_projected/run09_AAOEUCLID.png}
-    \caption{A* Euclidean-P }
-  \end{subfigure}\hfill
+  \end{subfigure}\hspace{1cm}
   \begin{subfigure}[b]{0.30\textwidth}
     \includegraphics[width=\textwidth]{../plots/astar/aosta/haversine/run09_AAOHAVERS.png}
     \caption{A* Haversine}
   \end{subfigure}
-  \caption{Paths returned by each algorithm on run~9 in Aosta. The projected Manhattan variant found a suboptimal path ($^\dagger$); all other variants return the optimal solution.}
+  \caption{Paths returned by each algorithm on run~9 in Aosta. The Manhattan variant found a suboptimal path ($^\dagger$); all other variants return the optimal solution.}
   \label{fig:paths_aosta}
 \end{figure}
 
 \subsection{Turin}
 
 Table~\ref{tab:results_turin} reports the results for the Turin network, which is roughly 14 times larger than Aosta.
-As in Aosta, the unprojected Manhattan and Euclidean variants produce iteration counts identical to Dijkstra.
-Projected Manhattan, projected Euclidean, and Haversine all achieve meaningful reductions.
+Manhattan, Euclidean, and Haversine all achieve meaningful reductions compared to Dijkstra.
 Path lengths and travel times are identical across all algorithms for every run, confirming that all variants find the same optimal path.
 
 \begin{table}[H]
   \centering
   \small
   \setlength{\tabcolsep}{5pt}
-  \begin{tabular}{crrrrrrrr}
+  \begin{tabular}{crrrrrr}
     \toprule
-    \textbf{Run} & \textbf{Dijkstra} & \textbf{Man.} & \textbf{Man.-P} & \textbf{Euc.} & \textbf{Euc.-P} & \textbf{Hav.} & \textbf{Dist.~(km)} & \textbf{Time~(s)} \\
+    \textbf{Run} & \textbf{Dijkstra} & \textbf{Manhattan} & \textbf{Euclidean} & \textbf{Haversine} & \textbf{Dist.~(km)} & \textbf{Time~(s)} \\
     \midrule
-    1  & 9\,927 & 9\,927 & 6\,314 & 9\,927 & 7\,128 & 7\,135 & 8.8877 & 633.13 \\
-    2  & 5\,100 & 5\,100 & 2\,775 & 5\,100 & 3\,230 & 3\,232 & 5.6477 & 423.60 \\
-    3  & 7\,508 & 7\,508 & 5\,773 & 7\,508 & 6\,379 & 6\,380 & 9.2594 & 697.13 \\
-    4  & 2\,233 & 2\,233 &   813 & 2\,233 & 1\,004 & 1\,004 & 3.6459 & 268.79 \\
-    5  & 8\,985 & 8\,985 & 4\,762 & 8\,985 & 5\,373 & 5\,375 & 6.9509 & 528.00 \\
-    6  & 6\,249 & 6\,249 & 3\,926 & 6\,249 & 4\,479 & 4\,481 & 7.0667 & 525.64 \\
-    7  & 4\,679 & 4\,679 & 1\,888 & 4\,679 & 2\,383 & 2\,383 & 3.7012 & 329.82 \\
-    8  & 4\,399 & 4\,399 & 2\,939 & 4\,399 & 3\,089 & 3\,093 & 8.3023 & 625.26 \\
-    9  & 5\,947 & 5\,947 & 2\,815 & 5\,947 & 3\,197 & 3\,197 & 7.0070 & 534.06 \\
-    10 & 4\,001 & 4\,001 & 1\,150 & 4\,001 & 1\,653 & 1\,655 & 4.3905 & 316.11 \\
+    1  & 9\,927 & 6\,314 & 7\,128 & 7\,135 & 8.8877 & 633.13 \\
+    2  & 5\,100 & 2\,775 & 3\,230 & 3\,232 & 5.6477 & 423.60 \\
+    3  & 7\,508 & 5\,773 & 6\,379 & 6\,380 & 9.2594 & 697.13 \\
+    4  & 2\,233 &   813 & 1\,004 & 1\,004 & 3.6459 & 268.79 \\
+    5  & 8\,985 & 4\,762 & 5\,373 & 5\,375 & 6.9509 & 528.00 \\
+    6  & 6\,249 & 3\,926 & 4\,479 & 4\,481 & 7.0667 & 525.64 \\
+    7  & 4\,679 & 1\,888 & 2\,383 & 2\,383 & 3.7012 & 329.82 \\
+    8  & 4\,399 & 2\,939 & 3\,089 & 3\,093 & 8.3023 & 625.26 \\
+    9  & 5\,947 & 2\,815 & 3\,197 & 3\,197 & 7.0070 & 534.06 \\
+    10 & 4\,001 & 1\,150 & 1\,653 & 1\,655 & 4.3905 & 316.11 \\
     \midrule
-    \textbf{Avg}   & 5\,902.8 & 5\,902.8 & 3\,315.5 & 5\,902.8 & 3\,791.5 & 3\,793.5 & & \\
-    \textbf{Impr.} & ---      & $0\%$    & $-43.8\%$ & $0\%$   & $-35.8\%$ & $-35.7\%$ & & \\
+    \textbf{Avg}   & 5\,902.8 & 3\,315.5 & 3\,791.5 & 3\,793.5 & & \\
+    \textbf{Impr.} & ---      & $-43.8\%$ & $-35.8\%$ & $-35.7\%$ & & \\
     \bottomrule
   \end{tabular}
   \caption{Iterations per run and average improvement over Dijkstra --- Turin (11\,766~nodes, 25\,198~edges).}
@@ -306,18 +295,15 @@ Path lengths and travel times are identical across all algorithms for every run,
 \subsection{Discussion}
 
 Path lengths and travel times are identical across all algorithm-run combinations in both cities, confirming optimal solutions on every run.
-The sole exception is A* Manhattan (projected) on run~9 in Aosta, which found a suboptimal path.
+The sole exception is A* Manhattan on run~9 in Aosta, which found a suboptimal path.
 This is a direct consequence of the Manhattan heuristic not being admissible: by overestimating the remaining cost on run~9, A* discards the true optimal branch before visiting it, committing to a suboptimal solution.
-A* Euclidean~(projected), which uses the same projected graph but with an admissible and consistent heuristic, correctly recovers the optimal solution.
+A* Euclidean, which uses the same projected graph but with an admissible and consistent heuristic, correctly recovers the optimal solution.
 
-The unprojected Manhattan and Euclidean variants produce iteration counts identical to Dijkstra in both cities (0\% improvement).
-This confirms the analysis in Section~\ref{sec:astar_design}: coordinate differences in decimal degrees are several orders of magnitude smaller than the edge-weight values, so $h(n) \approx 0$ and A* degenerates to Dijkstra.
-Evaluating the same heuristics on the projected graph shows substantially different behavior.
-Projected Manhattan achieves the largest reduction: $-59.1\%$ in Aosta and $-43.8\%$ in Turin.
-Projected Euclidean and Haversine perform similarly in both cities: in Aosta, $-47.7\%$ and $-47.7\%$ respectively; in Turin, $-35.8\%$  and $-35.7\%$.
-The near-identical performance of projected Euclidean and Haversine is expected: at the spatial scale of a single city, the Earth's curvature is negligible, and the great-circle distance computed by the Haversine formula closely approximates the Euclidean distance on a flat plane.
+Manhattan achieves the largest reduction in expanded nodes: $-59.1\%$ in Aosta and $-43.8\%$ in Turin.
+Euclidean and Haversine perform similarly in both cities: in Aosta, $-47.7\%$ and $-47.7\%$ respectively; in Turin, $-35.8\%$  and $-35.7\%$.
+The near-identical performance of Euclidean and Haversine is expected: at the spatial scale of a single city, the Earth's curvature is negligible, and the great-circle distance computed by the Haversine formula closely approximates the Euclidean distance in a planar setting.
 
-The larger reduction achieved by projected Manhattan compared to projected Euclidean is consistent with the known behavior of overestimating heuristics: by assigning higher $f(n)$ values to nodes farther from the goal, Manhattan focuses the search more aggressively, at the cost of admissibility, as evidenced by the suboptimal result on run~9 in Aosta.
+The larger reduction achieved by Manhattan compared to Euclidean is consistent with the known behavior of overestimating heuristics: by assigning higher $f(n)$ values to nodes farther from the goal, Manhattan focuses the search more aggressively, at the cost of admissibility, as evidenced by the suboptimal result on run~9 in Aosta.
 
 Overall, the results confirm that the effectiveness of A* depends on the dimensional consistency between the heuristic and the edge weights.
 When node coordinates are in metres (projected graph), all three heuristic functions provide meaningful guidance; when coordinates are in decimal degrees (unprojected graph), only Haversine produces a usable estimate, since \texttt{ox.distance.great\_circle} always returns distances in metres regardless of the input coordinate system.

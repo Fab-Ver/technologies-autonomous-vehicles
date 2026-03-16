@@ -24,7 +24,7 @@ def heuristic_manhattan(G, orig, dest):
     h(n) = |x1 - x2| + |y1 - y2| """
     x1, y1 = G.nodes[orig]["x"], G.nodes[orig]["y"]
     x2, y2 = G.nodes[dest]["x"], G.nodes[dest]["y"]
-    return abs(x1 - x2) + abs(y1 - y2) #meters or degrees depending on graph projection
+    return abs(x1 - x2) + abs(y1 - y2) #meters
 
 def heuristic_euclidean(G, orig, dest):
     """ Compute Euclidean distance between two nodes based on their x/y coordinates. 
@@ -33,7 +33,7 @@ def heuristic_euclidean(G, orig, dest):
     x1, y1 = G.nodes[orig]["x"], G.nodes[orig]["y"]
     x2, y2 = G.nodes[dest]["x"], G.nodes[dest]["y"]
     # Use osmnx's built-in function 
-    return ox.distance.euclidean(y1, x1, y2, x2) #meters or degrees depending on graph projection
+    return ox.distance.euclidean(y1, x1, y2, x2) #meters
 
 def heuristic_haversine(G, orig, dest):
     """h(n) = great-circle distance via haversine formula (R = 6371 km). 
@@ -44,14 +44,11 @@ def heuristic_haversine(G, orig, dest):
     return ox.distance.great_circle(lat1, lon1, lat2, lon2) #meters
 
 # (h_name, heuristic_func, use_projected_graph)
-# Manhattan and Euclidean are run twice: once on the original graph (lat/lon)
-# and once on the projected graph (metres).
-# Haversine always uses the original graph since great_circle() returns metres regardless.
+# Manhattan and Euclidean are run on the projected graph (metres, heuristic is effective).
+# Haversine uses the original graph since great_circle() returns metres regardless.
 CONFIGS = [
-    ("manhattan",           heuristic_manhattan, False),
-    ("manhattan_projected", heuristic_manhattan, True),
-    ("euclidean",           heuristic_euclidean, False),
-    ("euclidean_projected", heuristic_euclidean, True),
+    ("manhattan",           heuristic_manhattan, True),
+    ("euclidean",           heuristic_euclidean, True),
     ("haversine",           heuristic_haversine, False),
 ]
 
