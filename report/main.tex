@@ -305,9 +305,6 @@ The near-identical performance of Euclidean and Haversine is expected: at the sp
 
 The larger reduction achieved by Manhattan compared to Euclidean is consistent with the known behavior of overestimating heuristics: by assigning higher $f(n)$ values to nodes farther from the goal, Manhattan focuses the search more aggressively, at the cost of admissibility, as evidenced by the suboptimal result on run~9 in Aosta.
 
-Overall, the results confirm that the effectiveness of A* depends on the dimensional consistency between the heuristic and the edge weights.
-When node coordinates are in metres (projected graph), all three heuristic functions provide meaningful guidance; when coordinates are in decimal degrees (unprojected graph), only Haversine produces a usable estimate, since \texttt{ox.distance.great\_circle} always returns distances in metres regardless of the input coordinate system.
-
 The experiments demonstrate that A* can substantially reduce the number of node expansions required to find a shortest path in road networks, regardless of graph scale.
 The choice of heuristic plays a crucial role: Manhattan provides the most aggressive pruning, but at the cost of the optimality guarantee; Euclidean and Haversine offer a good trade-off, achieving meaningful reductions while preserving correctness.
 
