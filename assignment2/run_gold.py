@@ -58,6 +58,18 @@ def get_perspective_transformation():
     
     return matrix, roi_polygon, BEV_WIDTH, BEV_HEIGHT
 
+def enhance_lane_image(bev_image):
+    """
+    Grayscale conversion and noise reduction for lane enhancement.
+    """
+    # Convert the BEV image from BGR color space to Grayscale
+    gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian Blur to reduce random noise from the camera
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    return blurred
+
 def main(): 
     parser = argparse.ArgumentParser(description="Folder containg frontview images.")
     parser.add_argument("path", type=str, help="Search path of the directory containing the images to be processed")
@@ -78,7 +90,7 @@ def main():
     print(f"Found {len(image_paths)} images matching '{args.path}'")
 
     # Setup window
-    window_combined = "Original with ROI (Left) & BEV (Right)"
+    window_combined = "Original with ROI | BEV | Blurred BEV"
     cv2.namedWindow(window_combined, cv2.WINDOW_NORMAL)
     
     # Initialize the matrix
@@ -98,10 +110,17 @@ def main():
         # Warp to get the rectangular Bird's Eye View (BEV)
         bev = cv2.warpPerspective(frame, perspective_matrix, (bev_w, bev_h))
         
+        # --- LANE ENHANCEMENT ---
+        # Grayscale conversion and noise reduction
+        bev_blurred = enhance_lane_image(bev)
+        
         separator = np.zeros((frame.shape[0], 20, 3), dtype=np.uint8)
         
+        # Convert 1-channel blurred grayscale back to 3-channel for visualization purposes
+        bev_blurred_color = cv2.cvtColor(bev_blurred, cv2.COLOR_GRAY2BGR)
+        
         # Combine images side by side
-        combined_display = cv2.hconcat([display_frame, separator, bev])
+        combined_display = cv2.hconcat([display_frame, separator, bev, separator, bev_blurred_color])
         
         display_scale = 0.5
         resized_display = cv2.resize(combined_display, None, fx=display_scale, fy=display_scale)
