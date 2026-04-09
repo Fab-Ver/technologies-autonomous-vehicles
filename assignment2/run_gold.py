@@ -23,8 +23,8 @@ def get_perspective_transformation():
     pitch = PITCH
     
     # Real world ROI parameters
-    distAhead = 30.0       
-    spaceToOneSide = 2.5
+    distAhead = 20.0       
+    spaceToOneSide = 2.0
     bottomOffset = 6.0
 
     # 1. Find the vertices of the trapezoidal ROI using projective geometry
@@ -65,14 +65,20 @@ def enhance_lane_image(bev_image):
     # Convert the BEV image from BGR color space to Grayscale
     gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
     
-    # Apply Gaussian Blur to reduce random noise from the camera
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Use a rectangular kernel wider than the lane markings but shorter than cars/sky.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+    
+    # Apply White Top-Hat to keep only elements smaller than the kernel (like vertical lanes)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    
+    # Apply Gaussian Blur to reduce random noise from the top-hat output
+    blurred = cv2.GaussianBlur(tophat, (5, 5), 0)
     
     return blurred
 
 def binarize_image(blurred_image):
     """
-    Step 2: Image binarization using an iterative method to find the optimal threshold.
+    Image binarization using an iterative method to find the optimal threshold.
     """
     g_min = float(np.min(blurred_image))
     g_max = float(np.max(blurred_image))
@@ -109,38 +115,142 @@ def binarize_image(blurred_image):
     
     return binary_image
 
+def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickness=5):
+    """
+    Draws the fitted polynomial by checking the vicinity of the binary image 
+    to only draw where actual white pixels are present.
+    Applies for both continuous and dashed lines for high precision.
+    """
+    if len(points.shape) == 3:
+        pts = points[0]
+    else:
+        pts = points
+        
+    # Iterate through points and draw only where white pixels exist nearby
+    for i in range(len(pts) - 1):
+        pt1 = tuple(pts[i])
+        pt2 = tuple(pts[i+1])
+        
+        y = int((pt1[1] + pt2[1]) / 2)
+        x = int((pt1[0] + pt2[0]) / 2)
+        
+        if 0 <= y < binary_image.shape[0] and 0 <= x < binary_image.shape[1]:
+            # Look at a small window around the curve point in the binary image
+            y_min, y_max = max(0, y-3), min(binary_image.shape[0], y+4)
+            x_min, x_max = max(0, x-15), min(binary_image.shape[1], x+16)
+            
+            # If there's enough bright pixels in this region, draw this piece of the polynomial
+            if np.sum(binary_image[y_min:y_max, x_min:x_max] > 0) > 5:
+                cv2.line(img, pt1, pt2, color, thickness)
+
 def extract_lane_characteristics(binary_image, bev_color):
     """
-    Step 3: Extraction of lane characteristics.
+    Extraction of lane characteristics.
     """
-    # Sum the pixels in each column to build the histogram
-    # binary_image has shape (H, W). Summing along axis 0 gives (W,)
-    # We divide by 255 so the count represents the number of white pixels
-    histogram = np.sum(binary_image, axis=0) / 255.0
+    # Sum only the bottom half of the pixels in each column to build a clean baseline histogram
+    half_y = binary_image.shape[0] // 2
+    base_histogram = np.sum(binary_image[half_y:, :], axis=0) / 255.0
     
-    midpoint = int(histogram.shape[0] / 2)
-    left_half = histogram[:midpoint]
-    right_half = histogram[midpoint:]
+    midpoint = int(base_histogram.shape[0] / 2)
+    left_half = base_histogram[:midpoint]
+    right_half = base_histogram[midpoint:]
     
-    # We define a peak threshold (at least some pixels vertically to be considered a line)
-    # The image is 1080 pixels high, so let's require at least ~1% white pixels
+    # We define a peak threshold
     PEAK_THRESHOLD = binary_image.shape[0] * 0.01
     
-    lanes_found = 0
+    left_found = np.max(left_half) > PEAK_THRESHOLD
+    right_found = np.max(right_half) > PEAK_THRESHOLD
     
-    if np.max(left_half) > PEAK_THRESHOLD:
-        left_x = int(np.argmax(left_half))
-        cv2.line(bev_color, (left_x, 0), (left_x, bev_color.shape[0]), (0, 255, 0), 3)
-        lanes_found += 1
+    left_x_current = int(np.argmax(left_half)) if left_found else None
+    right_x_current = int(np.argmax(right_half)) + midpoint if right_found else None
+    
+    # Sliding window parameters
+    nwindows = 9
+    window_height = int(binary_image.shape[0] / nwindows)
+    margin = 60
+    minpix = 70
+    min_total_pixels = 200  # Stricter requirement to reduce false positives
+    
+    # Find all non-zero pixels in the image
+    nonzero = binary_image.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    
+    left_lane_inds = []
+    right_lane_inds = []
+    
+    left_windows_found = 0
+    right_windows_found = 0
+    
+    for window in range(nwindows):
+        # Identify window boundaries
+        win_y_low = binary_image.shape[0] - (window + 1) * window_height
+        win_y_high = binary_image.shape[0] - window * window_height
         
-    if np.max(right_half) > PEAK_THRESHOLD:
-        right_x = int(np.argmax(right_half)) + midpoint
-        cv2.line(bev_color, (right_x, 0), (right_x, bev_color.shape[0]), (0, 255, 0), 3)
-        lanes_found += 1
-        
-    if lanes_found < 2:
-        # Write "No lanes found" (or "Only 1 lane found" but assignment says "both lanes are not found")
-        if lanes_found == 0:
+        if left_found:
+            win_xleft_low = left_x_current - margin
+            win_xleft_high = left_x_current + margin
+            cv2.rectangle(bev_color, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 100, 0), 2)
+            
+            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+            left_lane_inds.append(good_left_inds)
+            
+            if len(good_left_inds) > minpix:
+                left_x_current = int(np.mean(nonzerox[good_left_inds]))
+                left_windows_found += 1
+                
+        if right_found:
+            win_xright_low = right_x_current - margin
+            win_xright_high = right_x_current + margin
+            cv2.rectangle(bev_color, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 100, 0), 2)
+            
+            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+            right_lane_inds.append(good_right_inds)
+            
+            if len(good_right_inds) > minpix:
+                right_x_current = int(np.mean(nonzerox[good_right_inds]))
+                right_windows_found += 1
+                
+    lanes_counted = 0
+    ploty = np.linspace(0, binary_image.shape[0]-1, binary_image.shape[0])
+    
+    # Analyze and draw left lane
+    # Condition: Must be found in at least 3 sliding windows and have minimum total pixels
+    if left_found and left_windows_found >= 3 and len(left_lane_inds) > 0:
+        left_lane_inds = np.concatenate(left_lane_inds)
+        if len(left_lane_inds) > min_total_pixels:
+            leftx = nonzerox[left_lane_inds]
+            lefty = nonzeroy[left_lane_inds]
+            
+            left_fit = np.polyfit(lefty, leftx, 2)
+            
+            # Constraint: A coefficient (curvature). Tighter value to avoid crazy curves from noise.
+            if abs(left_fit[0]) < 0.003:
+                left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+                pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))], np.int32)
+                draw_actual_lane_segments(bev_color, binary_image, pts_left, color=(0, 255, 0), thickness=5)
+                lanes_counted += 1
+            
+    # Analyze and draw right lane
+    if right_found and right_windows_found >= 3 and len(right_lane_inds) > 0:
+        right_lane_inds = np.concatenate(right_lane_inds)
+        if len(right_lane_inds) > min_total_pixels:
+            rightx = nonzerox[right_lane_inds]
+            righty = nonzeroy[right_lane_inds]
+            
+            right_fit = np.polyfit(righty, rightx, 2)
+            
+            # Constraint: A coefficient (curvature). Tighter value to avoid crazy curves from noise.
+            if abs(right_fit[0]) < 0.003:
+                right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+                pts_right = np.array([np.transpose(np.vstack([right_fitx, ploty]))], np.int32)
+                draw_actual_lane_segments(bev_color, binary_image, pts_right, color=(0, 255, 0), thickness=5)
+                lanes_counted += 1
+            
+    if lanes_counted < 2:
+        if lanes_counted == 0:
             text = "No lanes found"
         else:
             text = "One lane missing"
@@ -149,11 +259,12 @@ def extract_lane_characteristics(binary_image, bev_color):
         text_size = cv2.getTextSize(text, font, 1.5, 3)[0]
         text_x = (bev_color.shape[1] - text_size[0]) // 2
         text_y = (bev_color.shape[0] + text_size[1]) // 2
-        # Draw readable red text with white background/outline
         cv2.putText(bev_color, text, (text_x, text_y), font, 1.5, (255, 255, 255), 7, cv2.LINE_AA)
         cv2.putText(bev_color, text, (text_x, text_y), font, 1.5, (0, 0, 255), 3, cv2.LINE_AA)
         
-    return bev_color, histogram
+    # Return the full histogram so the visualizer window still works nicely
+    full_histogram = np.sum(binary_image, axis=0) / 255.0
+    return bev_color, full_histogram
 
 def draw_histogram(histogram, width, height):
     """
