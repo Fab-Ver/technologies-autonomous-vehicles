@@ -66,13 +66,17 @@ def enhance_lane_image(bev_image):
     gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
     
     # Use a rectangular kernel wider than the lane markings but shorter than cars/sky.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
     
     # Apply White Top-Hat to keep only elements smaller than the kernel (like vertical lanes)
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
     
-    # Apply Gaussian Blur to reduce random noise from the top-hat output
-    blurred = cv2.GaussianBlur(tophat, (5, 5), 0)
+    # Apply Sobel-X to extract vertical edges and suppress horizontal features (cars, horizon)
+    sobelx = cv2.Sobel(tophat, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_scaled = cv2.convertScaleAbs(sobelx)
+    
+    # Apply Gaussian Blur to reduce random noise from the sobel output
+    blurred = cv2.GaussianBlur(sobel_scaled, (5, 5), 0)
     
     return blurred
 
@@ -115,12 +119,14 @@ def binarize_image(blurred_image):
     
     return binary_image
 
-def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickness=5):
+def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickness=5, y_min_valid=0, y_max_valid=None):
     """
     Draws the fitted polynomial by checking the vicinity of the binary image 
-    to only draw where actual white pixels are present.
-    Applies for both continuous and dashed lines for high precision.
+    to only draw where actual white pixels are present and within bounded Y limits.
     """
+    if y_max_valid is None:
+        y_max_valid = img.shape[0]
+        
     if len(points.shape) == 3:
         pts = points[0]
     else:
@@ -134,6 +140,10 @@ def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickn
         y = int((pt1[1] + pt2[1]) / 2)
         x = int((pt1[0] + pt2[0]) / 2)
         
+        # Stop extrapolation: don't draw in the sky/cars if it wasn't tracked there
+        if y < y_min_valid or y > y_max_valid:
+            continue
+            
         if 0 <= y < binary_image.shape[0] and 0 <= x < binary_image.shape[1]:
             # Look at a small window around the curve point in the binary image
             y_min, y_max = max(0, y-3), min(binary_image.shape[0], y+4)
@@ -155,8 +165,8 @@ def extract_lane_characteristics(binary_image, bev_color):
     left_half = base_histogram[:midpoint]
     right_half = base_histogram[midpoint:]
     
-    # We define a peak threshold
-    PEAK_THRESHOLD = binary_image.shape[0] * 0.01
+    # We define a peak threshold (increased to 0.03 for stricter noise rejection)
+    PEAK_THRESHOLD = binary_image.shape[0] * 0.03
     
     left_found = np.max(left_half) > PEAK_THRESHOLD
     right_found = np.max(right_half) > PEAK_THRESHOLD
@@ -169,6 +179,7 @@ def extract_lane_characteristics(binary_image, bev_color):
     window_height = int(binary_image.shape[0] / nwindows)
     margin = 60
     minpix = 70
+    maxpix = int(window_height * margin * 2 * 0.25) # Blob rejection: if > 25% of window is white, it's noise
     min_total_pixels = 200  # Stricter requirement to reduce false positives
     
     # Find all non-zero pixels in the image
@@ -182,6 +193,9 @@ def extract_lane_characteristics(binary_image, bev_color):
     left_windows_found = 0
     right_windows_found = 0
     
+    left_x_prev = left_x_current
+    right_x_prev = right_x_current
+    
     for window in range(nwindows):
         # Identify window boundaries
         win_y_low = binary_image.shape[0] - (window + 1) * window_height
@@ -194,11 +208,20 @@ def extract_lane_characteristics(binary_image, bev_color):
             
             good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                               (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-            left_lane_inds.append(good_left_inds)
             
             if len(good_left_inds) > minpix:
-                left_x_current = int(np.mean(nonzerox[good_left_inds]))
-                left_windows_found += 1
+                if len(good_left_inds) > maxpix:
+                    left_found = False # Abort tracking: hit a massive noise blob (car/horizon)
+                else:
+                    new_left_x = int(np.mean(nonzerox[good_left_inds]))
+                    # Momentum check: Stop tracking if lane jumps abruptly laterally
+                    if left_windows_found == 0 or abs(new_left_x - left_x_prev) <= margin:
+                        left_lane_inds.append(good_left_inds)
+                        left_x_current = new_left_x
+                        left_x_prev = new_left_x
+                        left_windows_found += 1
+                    else:
+                        left_found = False # Abort tracking
                 
         if right_found:
             win_xright_low = right_x_current - margin
@@ -207,11 +230,20 @@ def extract_lane_characteristics(binary_image, bev_color):
             
             good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                                (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-            right_lane_inds.append(good_right_inds)
             
             if len(good_right_inds) > minpix:
-                right_x_current = int(np.mean(nonzerox[good_right_inds]))
-                right_windows_found += 1
+                if len(good_right_inds) > maxpix:
+                    right_found = False # Abort tracking: hit a massive noise blob (car/horizon)
+                else:
+                    new_right_x = int(np.mean(nonzerox[good_right_inds]))
+                    # Momentum check: Stop tracking if lane jumps abruptly laterally
+                    if right_windows_found == 0 or abs(new_right_x - right_x_prev) <= margin:
+                        right_lane_inds.append(good_right_inds)
+                        right_x_current = new_right_x
+                        right_x_prev = new_right_x
+                        right_windows_found += 1
+                    else:
+                        right_found = False # Abort tracking
                 
     lanes_counted = 0
     ploty = np.linspace(0, binary_image.shape[0]-1, binary_image.shape[0])
@@ -224,13 +256,17 @@ def extract_lane_characteristics(binary_image, bev_color):
             leftx = nonzerox[left_lane_inds]
             lefty = nonzeroy[left_lane_inds]
             
+            # Identify valid y-range where the lane was physically tracked
+            min_y_tracked = np.min(lefty)
+            max_y_tracked = np.max(lefty)
+            
             left_fit = np.polyfit(lefty, leftx, 2)
             
             # Constraint: A coefficient (curvature). Tighter value to avoid crazy curves from noise.
             if abs(left_fit[0]) < 0.003:
                 left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
                 pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))], np.int32)
-                draw_actual_lane_segments(bev_color, binary_image, pts_left, color=(0, 255, 0), thickness=5)
+                draw_actual_lane_segments(bev_color, binary_image, pts_left, color=(0, 255, 0), thickness=5, y_min_valid=min_y_tracked, y_max_valid=max_y_tracked)
                 lanes_counted += 1
             
     # Analyze and draw right lane
@@ -240,13 +276,17 @@ def extract_lane_characteristics(binary_image, bev_color):
             rightx = nonzerox[right_lane_inds]
             righty = nonzeroy[right_lane_inds]
             
+            # Identify valid y-range where the lane was physically tracked
+            min_y_tracked = np.min(righty)
+            max_y_tracked = np.max(righty)
+            
             right_fit = np.polyfit(righty, rightx, 2)
             
             # Constraint: A coefficient (curvature). Tighter value to avoid crazy curves from noise.
             if abs(right_fit[0]) < 0.003:
                 right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
                 pts_right = np.array([np.transpose(np.vstack([right_fitx, ploty]))], np.int32)
-                draw_actual_lane_segments(bev_color, binary_image, pts_right, color=(0, 255, 0), thickness=5)
+                draw_actual_lane_segments(bev_color, binary_image, pts_right, color=(0, 255, 0), thickness=5, y_min_valid=min_y_tracked, y_max_valid=max_y_tracked)
                 lanes_counted += 1
             
     if lanes_counted < 2:
@@ -256,11 +296,13 @@ def extract_lane_characteristics(binary_image, bev_color):
             text = "One lane missing"
             
         font = cv2.FONT_HERSHEY_SIMPLEX
-        text_size = cv2.getTextSize(text, font, 1.5, 3)[0]
+        font_scale = 1.0
+        thickness = 2
+        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
         text_x = (bev_color.shape[1] - text_size[0]) // 2
-        text_y = (bev_color.shape[0] + text_size[1]) // 2
-        cv2.putText(bev_color, text, (text_x, text_y), font, 1.5, (255, 255, 255), 7, cv2.LINE_AA)
-        cv2.putText(bev_color, text, (text_x, text_y), font, 1.5, (0, 0, 255), 3, cv2.LINE_AA)
+        text_y = 60  # Posizionato in alto anziché al centro
+        cv2.putText(bev_color, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness + 3, cv2.LINE_AA)
+        cv2.putText(bev_color, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
         
     # Return the full histogram so the visualizer window still works nicely
     full_histogram = np.sum(binary_image, axis=0) / 255.0
@@ -361,7 +403,7 @@ def main():
         cv2.imshow(window_combined, resized_display)
         
         # Display frames slowly (200ms). Press 'q' or ESC to exit early
-        key = cv2.waitKey(200) & 0xFF
+        key = cv2.waitKey(500) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
