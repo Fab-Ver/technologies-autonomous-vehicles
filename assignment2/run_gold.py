@@ -54,9 +54,10 @@ def get_perspective_transformation():
     
     # Calculate the homography matrix
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    inv_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
     roi_polygon = np.array([bl, br, tr, tl], np.int32)
     
-    return matrix, roi_polygon, BEV_WIDTH, BEV_HEIGHT
+    return matrix, inv_matrix, roi_polygon, BEV_WIDTH, BEV_HEIGHT
 
 def enhance_lane_image(bev_image):
     """
@@ -119,7 +120,7 @@ def binarize_image(blurred_image):
     
     return binary_image
 
-def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickness=5, y_min_valid=0, y_max_valid=None):
+def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickness=5, y_min_valid=0, y_max_valid=None, orig_img=None, Minv=None):
     """
     Draws the fitted polynomial by checking the vicinity of the binary image 
     to only draw where actual white pixels are present and within bounded Y limits.
@@ -152,8 +153,16 @@ def draw_actual_lane_segments(img, binary_image, points, color=(0,255,0), thickn
             # If there's enough bright pixels in this region, draw this piece of the polynomial
             if np.sum(binary_image[y_min:y_max, x_min:x_max] > 0) > 5:
                 cv2.line(img, pt1, pt2, color, thickness)
+                
+                # Transform points back to original image space
+                if orig_img is not None and Minv is not None:
+                    pts_float = np.array([[pt1, pt2]], dtype=np.float32)
+                    transformed_pts = cv2.perspectiveTransform(pts_float, Minv)[0]
+                    orig_pt1 = tuple(map(int, transformed_pts[0]))
+                    orig_pt2 = tuple(map(int, transformed_pts[1]))
+                    cv2.line(orig_img, orig_pt1, orig_pt2, color, thickness)
 
-def extract_lane_characteristics(binary_image, bev_color):
+def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=None):
     """
     Extraction of lane characteristics.
     """
@@ -266,7 +275,9 @@ def extract_lane_characteristics(binary_image, bev_color):
             if abs(left_fit[0]) < 0.003:
                 left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
                 pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))], np.int32)
-                draw_actual_lane_segments(bev_color, binary_image, pts_left, color=(0, 255, 0), thickness=5, y_min_valid=min_y_tracked, y_max_valid=max_y_tracked)
+                draw_actual_lane_segments(bev_color, binary_image, pts_left, color=(0, 255, 0), thickness=5, 
+                                          y_min_valid=min_y_tracked, y_max_valid=max_y_tracked, 
+                                          orig_img=orig_img, Minv=Minv)
                 lanes_counted += 1
             
     # Analyze and draw right lane
@@ -286,7 +297,9 @@ def extract_lane_characteristics(binary_image, bev_color):
             if abs(right_fit[0]) < 0.003:
                 right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
                 pts_right = np.array([np.transpose(np.vstack([right_fitx, ploty]))], np.int32)
-                draw_actual_lane_segments(bev_color, binary_image, pts_right, color=(0, 255, 0), thickness=5, y_min_valid=min_y_tracked, y_max_valid=max_y_tracked)
+                draw_actual_lane_segments(bev_color, binary_image, pts_right, color=(0, 255, 0), thickness=5, 
+                                          y_min_valid=min_y_tracked, y_max_valid=max_y_tracked, 
+                                          orig_img=orig_img, Minv=Minv)
                 lanes_counted += 1
             
     if lanes_counted < 2:
@@ -360,7 +373,7 @@ def main():
     cv2.namedWindow(window_combined, cv2.WINDOW_NORMAL)
     
     # Initialize the matrix
-    perspective_matrix, roi_polygon, bev_w, bev_h = get_perspective_transformation()
+    perspective_matrix, inv_matrix, roi_polygon, bev_w, bev_h = get_perspective_transformation()
     
     for img_path in image_paths:
         frame = cv2.imread(img_path)
@@ -384,7 +397,7 @@ def main():
         bev_binary = binarize_image(bev_blurred)
         
         # 3. Extraction of lane characteristics
-        bev_with_lanes, histogram = extract_lane_characteristics(bev_binary, bev.copy())
+        bev_with_lanes, histogram = extract_lane_characteristics(bev_binary, bev.copy(), orig_img=display_frame, Minv=inv_matrix)
         
         # Create histogram image for display
         hist_img = draw_histogram(histogram, bev_w, bev_h)
