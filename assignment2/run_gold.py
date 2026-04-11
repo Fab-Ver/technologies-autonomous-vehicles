@@ -17,17 +17,19 @@ PITCH  = ROTATION[1]
 
 # ── ROI parameters (meters) ──
 DIST_AHEAD = 20.0
-SPACE_TO_ONE_SIDE = 2.0
+SPACE_TO_ONE_SIDE = 2.5
 BOTTOM_OFFSET = 6.0
 
-# ── GOLD filter ──
-GOLD_FILTER_D = 6           # Symmetric filter half-width (pixels in BEV)
+# ── GOLD filter (multi-scale) ──
+GOLD_FILTER_D_VALUES = [4, 6, 8, 10]  # Multiple half-widths to handle thin and thick markings
 
 # ── Strip-based lane detection ──
 N_STRIPS = 40               # Number of horizontal strips for scanning
-SEARCH_MARGIN = 40           # Pixels to search around previous lane position
+SEARCH_MARGIN = 30           # Pixels to search around previous lane position
 WIDTH_TOLERANCE = 40         # Max deviation from expected lane width (GOLD constraint)
-MIN_STRIP_DETECTIONS = 5     # Min strips with detection to count a lane as found
+MAX_LATERAL_SHIFT = 10       # Max pixels a peak can shift between adjacent strips (GOLD vertical correlation)
+MIN_STRIP_DETECTIONS = 8     # Min total strip detections to count a lane as found
+MIN_SEGMENT_LENGTH = 4       # Min consecutive strips to form a drawable segment
 PEAK_THRESHOLD_RATIO = 0.03  # Min histogram peak for initial detection
 MIN_STRIP_PEAK_RATIO = 0.3   # Min peak in strip histogram (fraction of strip height)
 MIN_CLUSTER_WIDTH = 3        # Min adjacent columns above threshold to count as a real lane marking
@@ -72,36 +74,40 @@ def get_perspective_transformation():
     return matrix, inv_matrix, roi_polygon, BEV_WIDTH, BEV_HEIGHT
 
 
-def enhance_lane_image(bev_image, d=GOLD_FILTER_D):
+def enhance_lane_image(bev_image, d_values=GOLD_FILTER_D_VALUES):
     """
-    Grayscale conversion and lane enhancement using the GOLD symmetric filter.
+    Grayscale conversion and lane enhancement using a multi-scale GOLD filter.
     
     GOLD filter (Section IV.A.1):
       g(u,v) = min(f(u,v) - f(u-d,v), f(u,v) - f(u+d,v))  if both > 0
              = 0                                              otherwise
     
-    A pixel is accepted only if it is brighter than BOTH horizontal neighbors
-    at distance d. This rejects car edges (asymmetric) while preserving
-    lane markings (symmetric bright stripes on dark road).
+    Applied at multiple scales (d values) and combined via pixel-wise maximum.
+    This handles both thin and thick lane markings: small d catches thin lines,
+    large d catches wide markings whose center is missed by small d.
     """
     gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
     
     # Gaussian blur for noise reduction (professor's notes)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # GOLD symmetric brightness filter
     f = blurred.astype(np.float32)
     
-    diff_left  = np.zeros_like(f)
-    diff_right = np.zeros_like(f)
+    # Multi-scale GOLD filter: try each d, keep maximum response
+    result = np.zeros_like(f)
     
-    diff_left[:, d:]  = f[:, d:]  - f[:, :-d]
-    diff_right[:, :-d] = f[:, :-d] - f[:, d:]
+    for d in d_values:
+        diff_left  = np.zeros_like(f)
+        diff_right = np.zeros_like(f)
+        
+        diff_left[:, d:]  = f[:, d:]  - f[:, :-d]
+        diff_right[:, :-d] = f[:, :-d] - f[:, d:]
+        
+        g = np.minimum(diff_left, diff_right)
+        g[g < 0] = 0
+        
+        result = np.maximum(result, g)
     
-    g = np.minimum(diff_left, diff_right)
-    g[g < 0] = 0
-    
-    return g.astype(np.uint8)
+    return result.astype(np.uint8)
 
 
 def binarize_image(blurred_image):
@@ -135,10 +141,6 @@ def binarize_image(blurred_image):
 
     binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
     binary_image[blurred_image >= threshold] = 255
-    
-    # Morphological opening to remove isolated noise pixels (GOLD Section IV.B)
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel_clean)
     
     return binary_image
 
@@ -191,12 +193,18 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
     min_peak = strip_height * MIN_STRIP_PEAK_RATIO
     min_cluster_thresh = strip_height * 0.1  # lower threshold for cluster width check
     
-    left_detections = 0
-    right_detections = 0
+    # Collect detected points for each lane: list of (x, y_center) or None per strip
+    left_points = []
+    right_points = []
+    
+    # Track previous accepted peak positions for lateral shift check
+    left_prev_peak = left_x
+    right_prev_peak = right_x
     
     for strip_idx in range(N_STRIPS):
         y_bottom = h - strip_idx * strip_height
         y_top = h - (strip_idx + 1) * strip_height
+        y_center = (y_top + y_bottom) // 2
         
         if y_top < 0:
             break
@@ -213,10 +221,12 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
             local = strip_hist[sl:sr]
             if len(local) > 0 and np.max(local) > min_peak:
                 peak_idx = int(np.argmax(local))
-                # Cluster check: a real lane spans multiple adjacent columns
                 cluster = np.sum(local > min_cluster_thresh)
                 if cluster >= MIN_CLUSTER_WIDTH:
-                    left_peak_x = peak_idx + sl
+                    candidate_x = peak_idx + sl
+                    # Lateral shift check (GOLD vertical correlation)
+                    if left_prev_peak is None or abs(candidate_x - left_prev_peak) <= MAX_LATERAL_SHIFT:
+                        left_peak_x = candidate_x
         
         # ── Find right lane peak ──
         right_peak_x = None
@@ -228,62 +238,78 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
                 peak_idx = int(np.argmax(local))
                 cluster = np.sum(local > min_cluster_thresh)
                 if cluster >= MIN_CLUSTER_WIDTH:
-                    right_peak_x = peak_idx + sl
+                    candidate_x = peak_idx + sl
+                    if right_prev_peak is None or abs(candidate_x - right_prev_peak) <= MAX_LATERAL_SHIFT:
+                        right_peak_x = candidate_x
         
         # ── GOLD width constraint ──
-        # If both peaks are found, check that their distance matches expectation
         if left_peak_x is not None and right_peak_x is not None and expected_width is not None:
             current_width = right_peak_x - left_peak_x
             if abs(current_width - expected_width) > WIDTH_TOLERANCE:
-                # Width inconsistent with initial detection — skip this strip
+                left_points.append(None)
+                right_points.append(None)
                 continue
         
-        # ── Draw validated detections ──
+        # ── Record validated detections ──
         if left_peak_x is not None:
-            left_detections += 1
-            left_x = left_peak_x  # update position for next strip
-            
-            # Draw on BEV
-            cv2.line(bev_color, (left_peak_x, y_top), (left_peak_x, y_bottom),
-                     (0, 255, 0), 3)
-            
-            # Reproject to original image
-            if orig_img is not None and Minv is not None:
-                bev_pts = np.array(
-                    [[[float(left_peak_x), float(y_top)],
-                      [float(left_peak_x), float(y_bottom)]]],
-                    dtype=np.float32
-                )
-                orig_pts = cv2.perspectiveTransform(bev_pts, Minv)[0]
-                cv2.line(orig_img,
-                         tuple(map(int, orig_pts[0])),
-                         tuple(map(int, orig_pts[1])),
-                         (0, 255, 0), 3)
+            left_points.append((left_peak_x, y_center))
+            left_x = left_peak_x
+            left_prev_peak = left_peak_x
+        else:
+            left_points.append(None)
         
         if right_peak_x is not None:
-            right_detections += 1
+            right_points.append((right_peak_x, y_center))
             right_x = right_peak_x
-            
-            cv2.line(bev_color, (right_peak_x, y_top), (right_peak_x, y_bottom),
-                     (0, 255, 0), 3)
+            right_prev_peak = right_peak_x
+        else:
+            right_points.append(None)
+    
+    # ── Group points into continuous segments and draw as polylines ──
+    def group_into_segments(points_list):
+        """Split a list of (x,y)/None into continuous segments of consecutive detections."""
+        segments = []
+        current = []
+        for pt in points_list:
+            if pt is not None:
+                current.append(pt)
+            else:
+                if len(current) >= MIN_SEGMENT_LENGTH:
+                    segments.append(current)
+                current = []
+        if len(current) >= MIN_SEGMENT_LENGTH:
+            segments.append(current)
+        return segments
+    
+    def draw_segments(segments, img, color, thickness, orig_img=None, Minv=None,
+                      orig_thickness=5):
+        """Draw segments as polylines on BEV and optionally reproject to original image."""
+        count = 0
+        for seg in segments:
+            count += len(seg)
+            pts = np.array(seg, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], isClosed=False, color=color, thickness=thickness)
             
             if orig_img is not None and Minv is not None:
-                bev_pts = np.array(
-                    [[[float(right_peak_x), float(y_top)],
-                      [float(right_peak_x), float(y_bottom)]]],
-                    dtype=np.float32
-                )
-                orig_pts = cv2.perspectiveTransform(bev_pts, Minv)[0]
-                cv2.line(orig_img,
-                         tuple(map(int, orig_pts[0])),
-                         tuple(map(int, orig_pts[1])),
-                         (0, 255, 0), 3)
+                pts_float = np.array(seg, dtype=np.float32).reshape(-1, 1, 2)
+                orig_pts = cv2.perspectiveTransform(pts_float, Minv)
+                cv2.polylines(orig_img, [orig_pts.astype(np.int32)],
+                              isClosed=False, color=color, thickness=orig_thickness)
+        return count
+    
+    left_segments = group_into_segments(left_points)
+    right_segments = group_into_segments(right_points)
+    
+    left_total = draw_segments(left_segments, bev_color, (0, 255, 0), 3,
+                               orig_img, Minv)
+    right_total = draw_segments(right_segments, bev_color, (0, 255, 0), 3,
+                                orig_img, Minv)
     
     # ── Count detected lanes ──
     lanes_counted = 0
-    if left_detections >= MIN_STRIP_DETECTIONS:
+    if left_total >= MIN_STRIP_DETECTIONS:
         lanes_counted += 1
-    if right_detections >= MIN_STRIP_DETECTIONS:
+    if right_total >= MIN_STRIP_DETECTIONS:
         lanes_counted += 1
     
     if lanes_counted < 2:
@@ -350,7 +376,7 @@ def main():
         
     print(f"Found {len(image_paths)} images matching '{args.path}'")
 
-    window_combined = "Result (Original | BEV with Lanes | Binary | Histogram)"
+    window_combined = f"Result ({search_pattern})"
     cv2.namedWindow(window_combined, cv2.WINDOW_NORMAL)
     
     perspective_matrix, inv_matrix, roi_polygon, bev_w, bev_h = get_perspective_transformation()
@@ -375,22 +401,64 @@ def main():
         
         hist_img = draw_histogram(histogram, bev_w, bev_h)
         
-        separator = np.zeros((frame.shape[0], 20, 3), dtype=np.uint8)
+        # ── Add legend to original image ──
+        cv2.rectangle(display_frame, (10, 10), (320, 100), (0, 0, 0), -1)
+        cv2.rectangle(display_frame, (10, 10), (320, 100), (100, 100, 100), 2)
+        # ROI legend
+        cv2.line(display_frame, (25, 40), (65, 40), (0, 0, 255), 4)
+        cv2.putText(display_frame, "ROI", (80, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        # Lane legend
+        cv2.line(display_frame, (25, 78), (65, 78), (0, 255, 0), 4)
+        cv2.putText(display_frame, "Detected lanes", (80, 86),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        
         bev_binary_color = cv2.cvtColor(bev_binary, cv2.COLOR_GRAY2BGR)
         
-        combined_display = cv2.hconcat([
-            display_frame, separator,
-            bev_with_lanes, separator,
-            bev_binary_color, separator,
-            hist_img
-        ])
+        # ── Build titled panels ──
+        title_h = 40
+        sep_w = 12
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        font_thick = 2
+        title_color = (240, 240, 240)
+        bg_color = (40, 40, 40)
+        
+        panels = [
+            ("Original", display_frame),
+            ("BEV + Lanes", bev_with_lanes),
+            ("Binary", bev_binary_color),
+            ("Histogram", hist_img),
+        ]
+        
+        titled_panels = []
+        for title, panel in panels:
+            # Create title bar
+            title_bar = np.full((title_h, panel.shape[1], 3), bg_color, dtype=np.uint8)
+            text_size = cv2.getTextSize(title, font, font_scale, font_thick)[0]
+            text_x = (panel.shape[1] - text_size[0]) // 2
+            text_y = (title_h + text_size[1]) // 2
+            cv2.putText(title_bar, title, (text_x, text_y), font, font_scale,
+                        title_color, font_thick, cv2.LINE_AA)
+            titled_panels.append(np.vstack([title_bar, panel]))
+        
+        # Separators between panels
+        total_h = titled_panels[0].shape[0]
+        separator = np.full((total_h, sep_w, 3), bg_color, dtype=np.uint8)
+        
+        parts = [titled_panels[0]]
+        for tp in titled_panels[1:]:
+            parts.append(separator)
+            parts.append(tp)
+        
+        combined_display = cv2.hconcat(parts)
         
         display_scale = 0.4
         resized_display = cv2.resize(combined_display, None, fx=display_scale, fy=display_scale)
         
         cv2.imshow(window_combined, resized_display)
         
-        key = cv2.waitKey(500) & 0xFF
+        key = cv2.waitKey(100) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
