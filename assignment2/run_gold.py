@@ -220,10 +220,13 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
             sr = min(w, left_x + SEARCH_MARGIN)
             local = strip_hist[sl:sr]
             if len(local) > 0 and np.max(local) > min_peak:
-                peak_idx = int(np.argmax(local))
                 cluster = np.sum(local > min_cluster_thresh)
                 if cluster >= MIN_CLUSTER_WIDTH:
-                    candidate_x = peak_idx + sl
+                    # Weighted centroid for sub-pixel accuracy
+                    cols = np.arange(len(local))
+                    weights = local.copy()
+                    weights[weights < min_cluster_thresh] = 0
+                    candidate_x = int(np.average(cols, weights=weights)) + sl
                     # Lateral shift check (GOLD vertical correlation)
                     if left_prev_peak is None or abs(candidate_x - left_prev_peak) <= MAX_LATERAL_SHIFT:
                         left_peak_x = candidate_x
@@ -235,10 +238,12 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
             sr = min(w, right_x + SEARCH_MARGIN)
             local = strip_hist[sl:sr]
             if len(local) > 0 and np.max(local) > min_peak:
-                peak_idx = int(np.argmax(local))
                 cluster = np.sum(local > min_cluster_thresh)
                 if cluster >= MIN_CLUSTER_WIDTH:
-                    candidate_x = peak_idx + sl
+                    cols = np.arange(len(local))
+                    weights = local.copy()
+                    weights[weights < min_cluster_thresh] = 0
+                    candidate_x = int(np.average(cols, weights=weights)) + sl
                     if right_prev_peak is None or abs(candidate_x - right_prev_peak) <= MAX_LATERAL_SHIFT:
                         right_peak_x = candidate_x
         
@@ -283,16 +288,32 @@ def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=No
     
     def draw_segments(segments, img, color, thickness, orig_img=None, Minv=None,
                       orig_thickness=5):
-        """Draw segments as polylines on BEV and optionally reproject to original image."""
+        """Draw segments as fitted lines on BEV and reproject to original image.
+        
+        A linear fit through each segment's points produces a straight, clean line.
+        Multiple interpolated points are generated for smooth perspective reprojection.
+        """
         count = 0
         for seg in segments:
             count += len(seg)
-            pts = np.array(seg, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(img, [pts], isClosed=False, color=color, thickness=thickness)
+            xs = np.array([p[0] for p in seg], dtype=np.float64)
+            ys = np.array([p[1] for p in seg], dtype=np.float64)
+            
+            # Linear fit: x = a*y + b
+            fit = np.polyfit(ys, xs, 1)
+            
+            # Generate smooth points along the fitted line
+            y_min, y_max = ys.min(), ys.max()
+            n_points = max(len(seg), 20)  # enough points for smooth reprojection
+            y_fitted = np.linspace(y_min, y_max, n_points)
+            x_fitted = np.polyval(fit, y_fitted)
+            
+            fitted_pts = np.column_stack([x_fitted, y_fitted]).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [fitted_pts], isClosed=False, color=color, thickness=thickness)
             
             if orig_img is not None and Minv is not None:
-                pts_float = np.array(seg, dtype=np.float32).reshape(-1, 1, 2)
-                orig_pts = cv2.perspectiveTransform(pts_float, Minv)
+                fitted_float = np.column_stack([x_fitted, y_fitted]).astype(np.float32).reshape(-1, 1, 2)
+                orig_pts = cv2.perspectiveTransform(fitted_float, Minv)
                 cv2.polylines(orig_img, [orig_pts.astype(np.int32)],
                               isClosed=False, color=color, thickness=orig_thickness)
         return count
