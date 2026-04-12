@@ -23,13 +23,6 @@ BOTTOM_OFFSET    = 6.0
 # ── GOLD differential filter (multi-scale half-widths) ──
 GOLD_FILTER_D_VALUES = [4, 6, 8, 10]
 
-# ── Geodesic dilation ──
-GEODESIC_ITERATIONS = 3
-
-# ── Binarization (GOLD local adaptive threshold) ──
-BINARIZE_T            = 0.7
-BINARIZE_NEIGHBORHOOD = 7
-
 # ── Sliding window lane search ──
 NWINDOWS      = 9
 SW_MARGIN     = 100
@@ -112,49 +105,39 @@ def enhance_lane_image(bev_image, d_values=GOLD_FILTER_D_VALUES):
     return result.astype(np.uint8)
 
 
-# ═══════════════════════════ Step 3: Geodesic Dilation ═══════════════════════════
+# ═══════════════════════════ Step 3: Binarization ═══════════════════════════
 
-def geodesic_dilation(filtered_image, iterations=GEODESIC_ITERATIONS):
+def binarize_image(blurred_image):
     """
-    GOLD geodesic dilation (Section IV.A.1):
-    Propagates maximum brightness along connected regions of non-zero filter response.
-    Cross-shaped structuring element; zero-valued pixels act as barriers.
-    This makes lane markings more uniform for subsequent binarization.
+    Image binarization using the iterative method from the professor's notes.
+    Th_0 = (g_max + g_min) / 2, then iterate until convergence.
     """
-    mask = (filtered_image > 0).astype(np.uint8)
-    kernel = np.array([[0, 1, 0],
-                       [1, 1, 1],
-                       [0, 1, 0]], dtype=np.uint8)
+    g_min = float(np.min(blurred_image))
+    g_max = float(np.max(blurred_image))
+    
+    if g_max == g_min:
+        return np.zeros_like(blurred_image, dtype=np.uint8)
+        
+    threshold = (g_max + g_min) / 2.0
+    
+    while True:
+        region_A = blurred_image[blurred_image >= threshold]
+        region_B = blurred_image[blurred_image < threshold]
+        
+        g_A = np.mean(region_A) if len(region_A) > 0 else 0
+        g_B = np.mean(region_B) if len(region_B) > 0 else 0
+        
+        new_threshold = (g_A + g_B) / 2.0
+        
+        if abs(threshold - new_threshold) < 0.5:
+            threshold = new_threshold
+            break
+        threshold = new_threshold
 
-    current = filtered_image.copy()
-    for _ in range(iterations):
-        dilated = cv2.dilate(current, kernel)
-        current = (dilated * mask).astype(np.uint8)
-
-    return current
-
-
-# ═══════════════════════════ Step 4: Binarization ═══════════════════════════
-
-def binarize_image(enhanced_image, t=BINARIZE_T, neighborhood=BINARIZE_NEIGHBORHOOD):
-    """
-    GOLD local adaptive binarization (Section IV.A.1):
-      b(u,v) = 255  if e(u,v) >= t * max_{N(u,v)} e(i,j)
-             = 0    otherwise
-    Followed by morphological opening to remove isolated noise.
-    """
-    kernel = np.ones((neighborhood, neighborhood), dtype=np.uint8)
-    local_max = cv2.dilate(enhanced_image, kernel)
-    threshold_map = (t * local_max.astype(np.float32)).astype(np.uint8)
-
-    binary = np.zeros_like(enhanced_image, dtype=np.uint8)
-    binary[(enhanced_image >= threshold_map) & (enhanced_image > 0)] = 255
-
-    # Morphological opening to clean isolated noise
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
-
-    return binary
+    binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
+    binary_image[blurred_image >= threshold] = 255
+    
+    return binary_image
 
 
 # ═══════════════════════════ Step 5a: Sliding Window Histogram Search ═══════════════════════════
@@ -325,47 +308,12 @@ def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     return lane_type, segments, coverage
 
 
-# ═══════════════════════════ Step 8: Curvature Measurement ═══════════════════════════
-
-def measure_curvature(left_fitx, right_fitx, ploty, ym_per_pix, xm_per_pix):
-    """Calculate average radius of curvature in meters at the bottom of the image."""
-    y_eval = np.max(ploty)
-    curvatures = []
-
-    for fitx in [left_fitx, right_fitx]:
-        if fitx is not None:
-            fit_cr = np.polyfit(ploty * ym_per_pix, fitx * xm_per_pix, 2)
-            R = ((1 + (2 * fit_cr[0] * y_eval * ym_per_pix + fit_cr[1])**2)**1.5
-                 / max(np.absolute(2 * fit_cr[0]), 1e-6))
-            curvatures.append(R)
-
-    return np.mean(curvatures) if curvatures else None
-
-
-# ═══════════════════════════ Step 9: Vehicle Position ═══════════════════════════
-
-def measure_position(binary_warped, left_fit, right_fit, xm_per_pix):
-    """Calculate vehicle lateral offset from lane center in meters."""
-    if left_fit is None or right_fit is None:
-        return None
-
-    y_max = binary_warped.shape[0]
-    w     = binary_warped.shape[1]
-
-    left_x  = left_fit[0]  * y_max**2 + left_fit[1]  * y_max + left_fit[2]
-    right_x = right_fit[0] * y_max**2 + right_fit[1] * y_max + right_fit[2]
-    center_lanes = (left_x + right_x) / 2.0
-
-    return (w / 2.0 - center_lanes) * xm_per_pix
-
-
 # ═══════════════════════════ Step 10: Drawing ═══════════════════════════
 
 def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
                       left_fitx, right_fitx, M_inv,
                       left_type, right_type,
-                      left_segments, right_segments,
-                      curvature, veh_pos):
+                      left_segments, right_segments):
     """
     Draw lane area (green fill) and individual lane lines on BEV and original image.
     Solid lanes  → continuous green line along the full polynomial.
@@ -420,14 +368,7 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
     # ── Text overlay on original image ──
     font = cv2.FONT_HERSHEY_SIMPLEX
     y_txt = 70
-    if curvature is not None:
-        cv2.putText(orig_img, f"Curve Radius: {curvature:.1f} m",
-                    (40, y_txt), font, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
-        y_txt += 50
-    if veh_pos is not None:
-        cv2.putText(orig_img, f"Center Offset: {veh_pos:.2f} m",
-                    (40, y_txt), font, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
-        y_txt += 50
+
     if left_type:
         cv2.putText(orig_img, f"Left: {left_type}",
                     (40, y_txt), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
@@ -497,7 +438,7 @@ class LaneState:
 # ═══════════════════════════ Pipeline ═══════════════════════════
 
 def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
-                          bev_w, bev_h, state, ym_per_pix, xm_per_pix):
+                          bev_w, bev_h, state):
     """
     Full lane-detection pipeline for a single frame.
     BEV → GOLD filter → geodesic dilation → binarize → detect → fit → classify → draw
@@ -510,13 +451,10 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
     # Step 2: GOLD differential filter
     enhanced = enhance_lane_image(bev)
 
-    # Step 3: Geodesic dilation
-    dilated = geodesic_dilation(enhanced)
+    # Step 3: Global adaptive binarization (Professor's iterative method)
+    binary = binarize_image(enhanced)
 
-    # Step 4: Local adaptive binarization
-    binary = binarize_image(dilated)
-
-    # Step 5: Find lane pixels
+    # Step 4: Find lane pixels
     if not state.has_history:
         leftx, lefty, rightx, righty = find_lane_pixels_histogram(binary)
     else:
@@ -530,14 +468,14 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
             if len(righty) == 0:
                 rightx, righty = hx_r, hy_r
 
-    # Step 6: Polynomial fitting
+    # Step 5: Polynomial fitting
     left_fit, right_fit, left_fitx, right_fitx, ploty = \
         fit_polynomial(binary, leftx, lefty, rightx, righty)
 
-    # Step 7: Update frame history
+    # Step 6: Update frame history
     state.update(left_fit, right_fit)
 
-    # Step 8: Classify lane types
+    # Step 7: Classify lane types
     left_type, left_segments = None, []
     right_type, right_segments = None, []
     if left_fitx is not None:
@@ -545,20 +483,15 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
     if right_fitx is not None:
         right_type, right_segments, _ = classify_lane_type(binary, right_fitx, ploty)
 
-    # Step 9: Measurements
-    curvature = measure_curvature(left_fitx, right_fitx, ploty, ym_per_pix, xm_per_pix)
-    veh_pos   = measure_position(binary, left_fit, right_fit, xm_per_pix)
-
-    # Step 10: Draw overlays
+    # Step 8: Draw overlays
     bev_with_lanes, display_frame = draw_lane_overlay(
         display_frame, bev.copy(), binary, ploty,
         left_fitx, right_fitx, inv_matrix,
         left_type, right_type,
-        left_segments, right_segments,
-        curvature, veh_pos
+        left_segments, right_segments
     )
 
-    # Step 11: Handle missing lanes
+    # Step 10: Handle missing lanes
     lanes_count = (1 if left_fitx is not None else 0) + (1 if right_fitx is not None else 0)
     if lanes_count < 2:
         text = "No lanes found" if lanes_count == 0 else "One lane missing"
@@ -598,13 +531,12 @@ def main():
 
     window_name = f"Result ({search_pattern})"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1600, 600)  # Imposta una dimensione iniziale ragionevole
 
     # Perspective transform
     perspective_matrix, inv_matrix, roi_polygon, bev_w, bev_h = get_perspective_transformation()
 
-    # Pixel-to-meter conversion from ROI parameters
-    ym_per_pix = (DIST_AHEAD - BOTTOM_OFFSET) / bev_h
-    xm_per_pix = (2 * SPACE_TO_ONE_SIDE) / bev_w
+
 
     # Frame memory
     state = LaneState()
@@ -617,8 +549,7 @@ def main():
 
         # ── Run pipeline ──
         display_frame, bev_with_lanes, binary_color, histogram = lane_finding_pipeline(
-            frame, perspective_matrix, inv_matrix, bev_w, bev_h,
-            state, ym_per_pix, xm_per_pix
+            frame, perspective_matrix, inv_matrix, bev_w, bev_h, state
         )
 
         # ── ROI polygon on original ──
@@ -685,7 +616,8 @@ def main():
             parts.append(tp)
 
         combined = cv2.hconcat(parts)
-        resized  = cv2.resize(combined, None, fx=0.4, fy=0.4)
+        # Scalato a 0.5 o 0.6 per essere molto più grande 
+        resized  = cv2.resize(combined, None, fx=0.55, fy=0.55)
 
         cv2.imshow(window_name, resized)
 
