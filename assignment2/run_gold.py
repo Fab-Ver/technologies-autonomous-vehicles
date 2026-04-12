@@ -17,7 +17,7 @@ PITCH  = ROTATION[1]
 
 # ── ROI parameters (meters) ──
 DIST_AHEAD       = 20.0
-SPACE_TO_ONE_SIDE = 2.5
+SPACE_TO_ONE_SIDE = 2.2
 BOTTOM_OFFSET    = 6.0
 
 # ── GOLD differential filter (multi-scale half-widths) ──
@@ -25,15 +25,15 @@ GOLD_FILTER_D_VALUES = [4, 6, 8, 10]
 
 # ── Sliding window lane search ──
 NWINDOWS      = 9
-SW_MARGIN     = 100
+SW_MARGIN     = 45
 MINPIX        = 50
 MIN_PEAK_FRAC = 0.03   # minimum histogram peak to consider a lane present
 
 # ── Previous-polynomial search ──
-PREV_POLY_MARGIN = 100
+PREV_POLY_MARGIN = 45
 
 # ── Frame history for temporal smoothing ──
-HISTORY_LENGTH = 10
+HISTORY_LENGTH = 1
 
 # ── Lane type classification ──
 SOLID_COVERAGE_THRESHOLD = 0.55
@@ -137,6 +137,10 @@ def binarize_image(blurred_image):
     binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
     binary_image[blurred_image >= threshold] = 255
     
+    # Filtraggio Morfologico Direzionale (Opening con kernel verticale)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 30))
+    binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel)
+    
     return binary_image
 
 
@@ -150,7 +154,15 @@ def find_lane_pixels_histogram(binary_warped):
     h, w = binary_warped.shape
     histogram = np.sum(binary_warped[h // 2:, :], axis=0).astype(np.float64)
 
+    # Mascheratura dell'istogramma (ignore center vehicle and extreme edges)
+    edge_margin = int(w * 0.1)
+    center_margin = int(w * 0.1)
     midpoint = w // 2
+    
+    histogram[:edge_margin] = 0
+    histogram[-edge_margin:] = 0
+    histogram[midpoint - center_margin:midpoint + center_margin] = 0
+
     left_half  = histogram[:midpoint]
     right_half = histogram[midpoint:]
 
@@ -251,21 +263,62 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
     left_fit = right_fit = None
     left_fitx = right_fitx = None
 
-    if len(lefty) > 0 and len(leftx) > 0:
-        try:
-            left_fit  = np.polyfit(lefty, leftx, 2)
-            left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
-        except (np.linalg.LinAlgError, TypeError):
-            pass
+    # 1. Y-spread and pixel density check
+    if len(lefty) > 200 and len(leftx) > 0:
+        if (np.max(lefty) - np.min(lefty)) >= h * 0.3:
+            try:
+                fit = np.polyfit(lefty, leftx, 2)
+                # Curvature physical check
+                if abs(fit[0]) <= 0.001:
+                    left_fit = fit
+                    left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
+            except (np.linalg.LinAlgError, TypeError):
+                pass
 
-    if len(righty) > 0 and len(rightx) > 0:
-        try:
-            right_fit  = np.polyfit(righty, rightx, 2)
-            right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
-        except (np.linalg.LinAlgError, TypeError):
-            pass
+    if len(righty) > 200 and len(rightx) > 0:
+        if (np.max(righty) - np.min(righty)) >= h * 0.3:
+            try:
+                fit = np.polyfit(righty, rightx, 2)
+                if abs(fit[0]) <= 0.001:
+                    right_fit = fit
+                    right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+            except (np.linalg.LinAlgError, TypeError):
+                pass
 
     return left_fit, right_fit, left_fitx, right_fitx, ploty
+
+
+# ═══════════════════════════ Step 6b: Sanity Checks ═══════════════════════════
+
+def is_valid_lane(left_fitx, right_fitx, bev_w):
+    """
+    Sanity check for the fitted lane polynomials.
+    """
+    if left_fitx is None or right_fitx is None:
+        return True # Ignora se manca una corsia per evitare drop
+        
+    widths = right_fitx - left_fitx
+    
+    # 1. Non scendere mai sotto il 25% della BEV width
+    if np.any(widths < bev_w * 0.25):
+        return False
+        
+    avg_width = np.mean(widths)
+    # 2. Larghezza media realistica (30% - 70% della BEV width)?
+    if not (0.3 * bev_w <= avg_width <= 0.7 * bev_w):
+        return False
+        
+    # 3. Parallelismo mirato (Top vs Bottom)
+    width_top = widths[0]
+    width_bottom = widths[-1]
+    
+    target_lane_width = bev_w * (3.7 / 4.6)
+    diff = abs(width_top - width_bottom)
+    
+    if diff > 0.25 * target_lane_width:
+        return False
+        
+    return True
 
 
 # ═══════════════════════════ Step 7: Lane Type Classification ═══════════════════════════
@@ -313,7 +366,8 @@ def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
 def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
                       left_fitx, right_fitx, M_inv,
                       left_type, right_type,
-                      left_segments, right_segments):
+                      left_segments, right_segments,
+                      draw_polygon=False):
     """
     Draw lane area (green fill) and individual lane lines on BEV and original image.
     Solid lanes  → continuous green line along the full polynomial.
@@ -322,7 +376,7 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
     h, w = binary_warped.shape
 
     # ── Green fill between the two lanes (BEV + original) ──
-    if left_fitx is not None and right_fitx is not None:
+    if left_fitx is not None and right_fitx is not None and draw_polygon:
         warp_zero  = np.zeros((h, w), dtype=np.uint8)
         color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
 
@@ -350,7 +404,7 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
             color = (0, 255, 255)   # yellow for dashed
             # Dashed: draw only the segments where actual markings are detected
             for (s, e) in segments:
-                if e - s < 2:
+                if e - s < 40:
                     continue
                 seg_x = fitx[s:e + 1]
                 seg_y = ploty[s:e + 1]
@@ -409,6 +463,7 @@ class LaneState:
     def __init__(self):
         self.left_fit_history  = []
         self.right_fit_history = []
+        self.missed_frames = 0
 
     @property
     def has_history(self):
@@ -423,8 +478,18 @@ class LaneState:
             prev_right = np.mean(np.array(self.right_fit_history), axis=0)
         return prev_left, prev_right
 
-    def update(self, left_fit, right_fit):
+    def update(self, left_fit=None, right_fit=None):
         """Add new fit to history; trim to HISTORY_LENGTH."""
+        # Controlla la scadenza della memoria
+        if left_fit is None and right_fit is None:
+            self.missed_frames += 1
+            if self.missed_frames > 5:
+                self.left_fit_history.clear()
+                self.right_fit_history.clear()
+        else:
+            self.missed_frames = 0
+            
+        # Support independent updates implicitly
         if left_fit is not None:
             self.left_fit_history.append(left_fit.copy())
             if len(self.left_fit_history) > HISTORY_LENGTH:
@@ -472,8 +537,44 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
     left_fit, right_fit, left_fitx, right_fitx, ploty = \
         fit_polynomial(binary, leftx, lefty, rightx, righty)
 
-    # Step 6: Update frame history
+    # Step 6: Sanity Check & Frame History Update
+    target_lane_width = bev_w * (3.7 / 4.6)
+    draw_polygon = False
+    
+    # Valuta la coppia se entrambe sono state stimate
+    if left_fitx is not None and right_fitx is not None:
+        if not is_valid_lane(left_fitx, right_fitx, bev_w):
+            # Previene il suicidio di coppia: scarta solo la linea meno affidabile
+            if len(lefty) < len(righty):
+                left_fit = left_fitx = None
+            else:
+                right_fit = right_fitx = None
+        else:
+            draw_polygon = True
+
+    # Valuta nativamente chi è reale prima dei ripieghi indotti
+    left_detected = left_fit is not None
+    right_detected = right_fit is not None
+
+    # Aggiornamento indipendente della memoria del frame corretto
     state.update(left_fit, right_fit)
+
+    # Indipendent Fallback
+    prev_left, prev_right = state.get_averaged_fit()
+    
+    if left_fitx is None and prev_left is not None:
+        left_fit = prev_left
+        left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
+
+    if right_fitx is None and prev_right is not None:
+        right_fit = prev_right
+        right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+        
+    # Inferenza della corsia gemella (es. curva a destra ma manca il lato sx)
+    if left_fitx is not None and right_fitx is None:
+        right_fitx = left_fitx + target_lane_width
+    elif right_fitx is not None and left_fitx is None:
+        left_fitx = right_fitx - target_lane_width
 
     # Step 7: Classify lane types
     left_type, left_segments = None, []
@@ -488,11 +589,12 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
         display_frame, bev.copy(), binary, ploty,
         left_fitx, right_fitx, inv_matrix,
         left_type, right_type,
-        left_segments, right_segments
+        left_segments, right_segments,
+        draw_polygon=draw_polygon
     )
 
     # Step 10: Handle missing lanes
-    lanes_count = (1 if left_fitx is not None else 0) + (1 if right_fitx is not None else 0)
+    lanes_count = (1 if left_detected else 0) + (1 if right_detected else 0)
     if lanes_count < 2:
         text = "No lanes found" if lanes_count == 0 else "One lane missing"
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -621,7 +723,7 @@ def main():
 
         cv2.imshow(window_name, resized)
 
-        key = cv2.waitKey(100) & 0xFF
+        key = cv2.waitKey(200) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
