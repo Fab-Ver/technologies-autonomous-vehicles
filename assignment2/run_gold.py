@@ -12,377 +12,577 @@ FOCAL_LENGTH    = np.array([1970, 1970])
 POSITION        = np.array([1.8750, 0, 1.6600])
 ROTATION        = np.array([0, 0, 0])
 
-HEIGHT = POSITION[2]   
+HEIGHT = POSITION[2]
 PITCH  = ROTATION[1]
 
 # ── ROI parameters (meters) ──
-DIST_AHEAD = 20.0
+DIST_AHEAD       = 20.0
 SPACE_TO_ONE_SIDE = 2.5
-BOTTOM_OFFSET = 6.0
+BOTTOM_OFFSET    = 6.0
 
-# ── GOLD filter (multi-scale) ──
-GOLD_FILTER_D_VALUES = [4, 6, 8, 10]  # Multiple half-widths to handle thin and thick markings
+# ── GOLD differential filter (multi-scale half-widths) ──
+GOLD_FILTER_D_VALUES = [4, 6, 8, 10]
 
-# ── Strip-based lane detection ──
-N_STRIPS = 40               # Number of horizontal strips for scanning
-SEARCH_MARGIN = 30           # Pixels to search around previous lane position
-WIDTH_TOLERANCE = 40         # Max deviation from expected lane width (GOLD constraint)
-MAX_LATERAL_SHIFT = 10       # Max pixels a peak can shift between adjacent strips (GOLD vertical correlation)
-MIN_STRIP_DETECTIONS = 8     # Min total strip detections to count a lane as found
-MIN_SEGMENT_LENGTH = 4       # Min consecutive strips to form a drawable segment
-PEAK_THRESHOLD_RATIO = 0.03  # Min histogram peak for initial detection
-MIN_STRIP_PEAK_RATIO = 0.3   # Min peak in strip histogram (fraction of strip height)
-MIN_CLUSTER_WIDTH = 3        # Min adjacent columns above threshold to count as a real lane marking
+# ── Geodesic dilation ──
+GEODESIC_ITERATIONS = 3
 
+# ── Binarization (GOLD local adaptive threshold) ──
+BINARIZE_T            = 0.7
+BINARIZE_NEIGHBORHOOD = 7
+
+# ── Sliding window lane search ──
+NWINDOWS      = 9
+SW_MARGIN     = 100
+MINPIX        = 50
+MIN_PEAK_FRAC = 0.03   # minimum histogram peak to consider a lane present
+
+# ── Previous-polynomial search ──
+PREV_POLY_MARGIN = 100
+
+# ── Frame history for temporal smoothing ──
+HISTORY_LENGTH = 10
+
+# ── Lane type classification ──
+SOLID_COVERAGE_THRESHOLD = 0.55
+LANE_CHECK_MARGIN        = 15
+
+
+# ═══════════════════════════ Step 1: Perspective Transform ═══════════════════════════
 
 def get_perspective_transformation():
     """
-    Compute the perspective transform (IPM) from camera parameters and ROI definition.
-    Returns the forward homography, inverse homography, ROI polygon, and BEV dimensions.
+    Compute IPM from camera parameters and ROI.
+    Returns forward/inverse homographies, ROI polygon, and BEV dimensions.
     """
     f_x, f_y = FOCAL_LENGTH
     c_x, c_y = PRINCIPAL_POINT
     H = HEIGHT
 
     def project_to_image(X, Z):
-        """Project a world-plane point (X, 0, Z) to image coordinates."""
         u = (f_x * X / Z) + c_x
         v = (f_y * H / Z) + c_y
         return [u, v]
-        
-    bl = project_to_image(-SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)  # Bottom-Left
-    br = project_to_image( SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)  # Bottom-Right
-    tr = project_to_image( SPACE_TO_ONE_SIDE, DIST_AHEAD)     # Top-Right
-    tl = project_to_image(-SPACE_TO_ONE_SIDE, DIST_AHEAD)     # Top-Left
-    
+
+    bl = project_to_image(-SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)
+    br = project_to_image( SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)
+    tr = project_to_image( SPACE_TO_ONE_SIDE, DIST_AHEAD)
+    tl = project_to_image(-SPACE_TO_ONE_SIDE, DIST_AHEAD)
+
     src_pts = np.float32([bl, br, tr, tl])
-    
+
     BEV_HEIGHT = IMAGE_SIZE[1]
-    BEV_WIDTH = int(BEV_HEIGHT * (2 * SPACE_TO_ONE_SIDE) / (DIST_AHEAD - BOTTOM_OFFSET))
-    
+    BEV_WIDTH  = int(BEV_HEIGHT * (2 * SPACE_TO_ONE_SIDE) / (DIST_AHEAD - BOTTOM_OFFSET))
+
     dst_pts = np.float32([
         [0, BEV_HEIGHT],
         [BEV_WIDTH, BEV_HEIGHT],
         [BEV_WIDTH, 0],
         [0, 0]
     ])
-    
-    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+    matrix     = cv2.getPerspectiveTransform(src_pts, dst_pts)
     inv_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
     roi_polygon = np.array(src_pts, np.int32)
-    
+
     return matrix, inv_matrix, roi_polygon, BEV_WIDTH, BEV_HEIGHT
 
 
+# ═══════════════════════════ Step 2: GOLD Differential Filter ═══════════════════════════
+
 def enhance_lane_image(bev_image, d_values=GOLD_FILTER_D_VALUES):
     """
-    Grayscale conversion and lane enhancement using a multi-scale GOLD filter.
-    
-    GOLD filter (Section IV.A.1):
-      g(u,v) = min(f(u,v) - f(u-d,v), f(u,v) - f(u+d,v))  if both > 0
-             = 0                                              otherwise
-    
-    Applied at multiple scales (d values) and combined via pixel-wise maximum.
-    This handles both thin and thick lane markings: small d catches thin lines,
-    large d catches wide markings whose center is missed by small d.
+    GOLD differential filter (Section IV.A.1):
+      g(u,v) = min(f(u,v)-f(u-d,v), f(u,v)-f(u+d,v))  if both > 0, else 0
+    Applied at multiple d values, combined via pixel-wise maximum.
     """
     gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
-    
-    # Gaussian blur for noise reduction (professor's notes)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     f = blurred.astype(np.float32)
-    
-    # Multi-scale GOLD filter: try each d, keep maximum response
+
     result = np.zeros_like(f)
-    
     for d in d_values:
         diff_left  = np.zeros_like(f)
         diff_right = np.zeros_like(f)
-        
-        diff_left[:, d:]  = f[:, d:]  - f[:, :-d]
+        diff_left[:, d:]   = f[:, d:]   - f[:, :-d]
         diff_right[:, :-d] = f[:, :-d] - f[:, d:]
-        
         g = np.minimum(diff_left, diff_right)
         g[g < 0] = 0
-        
         result = np.maximum(result, g)
-    
+
     return result.astype(np.uint8)
 
 
-def binarize_image(blurred_image):
-    """
-    Image binarization using the iterative method from the professor's notes.
-    
-    Th_0 = (g_max + g_min) / 2, then iterate until convergence.
-    Followed by morphological opening to remove isolated noise pixels.
-    """
-    g_min = float(np.min(blurred_image))
-    g_max = float(np.max(blurred_image))
-    
-    if g_max == g_min:
-        return np.zeros_like(blurred_image, dtype=np.uint8)
-        
-    threshold = (g_max + g_min) / 2.0
-    
-    while True:
-        region_A = blurred_image[blurred_image >= threshold]
-        region_B = blurred_image[blurred_image < threshold]
-        
-        g_A = np.mean(region_A) if len(region_A) > 0 else 0
-        g_B = np.mean(region_B) if len(region_B) > 0 else 0
-        
-        new_threshold = (g_A + g_B) / 2.0
-        
-        if abs(threshold - new_threshold) < 0.5:
-            threshold = new_threshold
-            break
-        threshold = new_threshold
+# ═══════════════════════════ Step 3: Geodesic Dilation ═══════════════════════════
 
-    binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
-    binary_image[blurred_image >= threshold] = 255
-    
-    return binary_image
+def geodesic_dilation(filtered_image, iterations=GEODESIC_ITERATIONS):
+    """
+    GOLD geodesic dilation (Section IV.A.1):
+    Propagates maximum brightness along connected regions of non-zero filter response.
+    Cross-shaped structuring element; zero-valued pixels act as barriers.
+    This makes lane markings more uniform for subsequent binarization.
+    """
+    mask = (filtered_image > 0).astype(np.uint8)
+    kernel = np.array([[0, 1, 0],
+                       [1, 1, 1],
+                       [0, 1, 0]], dtype=np.uint8)
+
+    current = filtered_image.copy()
+    for _ in range(iterations):
+        dilated = cv2.dilate(current, kernel)
+        current = (dilated * mask).astype(np.uint8)
+
+    return current
 
 
-def extract_lane_characteristics(binary_image, bev_color, orig_img=None, Minv=None):
+# ═══════════════════════════ Step 4: Binarization ═══════════════════════════
+
+def binarize_image(enhanced_image, t=BINARIZE_T, neighborhood=BINARIZE_NEIGHBORHOOD):
     """
-    Lane detection using strip-by-strip histogram analysis.
-    
-    Extends the professor's histogram method to curved lanes by analyzing
-    horizontal strips independently. GOLD's width constraint validates
-    that both lanes maintain a consistent distance.
-    
-    Pipeline:
-      1. Histogram of bottom half → find initial lane positions (professor's method)
-      2. Compute expected lane width from initial detection
-      3. For each strip (bottom to top):
-         a) Local histogram around previous positions → find peaks
-         b) GOLD width constraint: distance between peaks must be consistent
-         c) Draw directly at detected positions (no polynomial fitting)
-      4. Reproject each drawn segment to original image via inverse homography
+    GOLD local adaptive binarization (Section IV.A.1):
+      b(u,v) = 255  if e(u,v) >= t * max_{N(u,v)} e(i,j)
+             = 0    otherwise
+    Followed by morphological opening to remove isolated noise.
     """
-    h, w = binary_image.shape
-    
-    # ── Step 1: Initial histogram of bottom half → starting positions ──
-    half_y = h // 2
-    base_histogram = np.sum(binary_image[half_y:, :], axis=0) / 255.0
-    
-    # Smooth histogram to reduce noise peaks (GOLD low-pass filter)
-    base_histogram_smooth = cv2.GaussianBlur(
-        base_histogram.reshape(1, -1).astype(np.float64), (1, 21), 0
-    ).flatten()
-    
+    kernel = np.ones((neighborhood, neighborhood), dtype=np.uint8)
+    local_max = cv2.dilate(enhanced_image, kernel)
+    threshold_map = (t * local_max.astype(np.float32)).astype(np.uint8)
+
+    binary = np.zeros_like(enhanced_image, dtype=np.uint8)
+    binary[(enhanced_image >= threshold_map) & (enhanced_image > 0)] = 255
+
+    # Morphological opening to clean isolated noise
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
+
+    return binary
+
+
+# ═══════════════════════════ Step 5a: Sliding Window Histogram Search ═══════════════════════════
+
+def find_lane_pixels_histogram(binary_warped):
+    """
+    Find lane pixels using histogram peaks + sliding windows.
+    Used for the first frame or when previous-poly search fails.
+    """
+    h, w = binary_warped.shape
+    histogram = np.sum(binary_warped[h // 2:, :], axis=0).astype(np.float64)
+
     midpoint = w // 2
-    left_half = base_histogram_smooth[:midpoint]
-    right_half = base_histogram_smooth[midpoint:]
-    
-    peak_threshold = h * PEAK_THRESHOLD_RATIO
-    
-    left_found = np.max(left_half) > peak_threshold if len(left_half) > 0 else False
-    right_found = np.max(right_half) > peak_threshold if len(right_half) > 0 else False
-    
-    left_x = int(np.argmax(left_half)) if left_found else None
-    right_x = int(np.argmax(right_half)) + midpoint if right_found else None
-    
-    # ── Step 2: Expected lane width from initial detection (GOLD constraint) ──
-    expected_width = (right_x - left_x) if (left_found and right_found) else None
-    
-    # ── Step 3: Strip-by-strip scanning from bottom to top ──
-    strip_height = max(h // N_STRIPS, 1)
-    min_peak = strip_height * MIN_STRIP_PEAK_RATIO
-    min_cluster_thresh = strip_height * 0.1  # lower threshold for cluster width check
-    
-    # Collect detected points for each lane: list of (x, y_center) or None per strip
-    left_points = []
-    right_points = []
-    
-    # Track previous accepted peak positions for lateral shift check
-    left_prev_peak = left_x
-    right_prev_peak = right_x
-    
-    for strip_idx in range(N_STRIPS):
-        y_bottom = h - strip_idx * strip_height
-        y_top = h - (strip_idx + 1) * strip_height
-        y_center = (y_top + y_bottom) // 2
-        
-        if y_top < 0:
-            break
-        
-        # Compute strip column histogram
-        strip = binary_image[y_top:y_bottom, :]
-        strip_hist = np.sum(strip, axis=0) / 255.0
-        
-        # ── Find left lane peak ──
-        left_peak_x = None
-        if left_x is not None:
-            sl = max(0, left_x - SEARCH_MARGIN)
-            sr = min(w, left_x + SEARCH_MARGIN)
-            local = strip_hist[sl:sr]
-            if len(local) > 0 and np.max(local) > min_peak:
-                cluster = np.sum(local > min_cluster_thresh)
-                if cluster >= MIN_CLUSTER_WIDTH:
-                    # Weighted centroid for sub-pixel accuracy
-                    cols = np.arange(len(local))
-                    weights = local.copy()
-                    weights[weights < min_cluster_thresh] = 0
-                    candidate_x = int(np.average(cols, weights=weights)) + sl
-                    # Lateral shift check (GOLD vertical correlation)
-                    if left_prev_peak is None or abs(candidate_x - left_prev_peak) <= MAX_LATERAL_SHIFT:
-                        left_peak_x = candidate_x
-        
-        # ── Find right lane peak ──
-        right_peak_x = None
-        if right_x is not None:
-            sl = max(0, right_x - SEARCH_MARGIN)
-            sr = min(w, right_x + SEARCH_MARGIN)
-            local = strip_hist[sl:sr]
-            if len(local) > 0 and np.max(local) > min_peak:
-                cluster = np.sum(local > min_cluster_thresh)
-                if cluster >= MIN_CLUSTER_WIDTH:
-                    cols = np.arange(len(local))
-                    weights = local.copy()
-                    weights[weights < min_cluster_thresh] = 0
-                    candidate_x = int(np.average(cols, weights=weights)) + sl
-                    if right_prev_peak is None or abs(candidate_x - right_prev_peak) <= MAX_LATERAL_SHIFT:
-                        right_peak_x = candidate_x
-        
-        # ── GOLD width constraint ──
-        if left_peak_x is not None and right_peak_x is not None and expected_width is not None:
-            current_width = right_peak_x - left_peak_x
-            if abs(current_width - expected_width) > WIDTH_TOLERANCE:
-                left_points.append(None)
-                right_points.append(None)
-                continue
-        
-        # ── Record validated detections ──
-        if left_peak_x is not None:
-            left_points.append((left_peak_x, y_center))
-            left_x = left_peak_x
-            left_prev_peak = left_peak_x
-        else:
-            left_points.append(None)
-        
-        if right_peak_x is not None:
-            right_points.append((right_peak_x, y_center))
-            right_x = right_peak_x
-            right_prev_peak = right_peak_x
-        else:
-            right_points.append(None)
-    
-    # ── Group points into continuous segments and draw as polylines ──
-    def group_into_segments(points_list):
-        """Split a list of (x,y)/None into continuous segments of consecutive detections."""
-        segments = []
-        current = []
-        for pt in points_list:
-            if pt is not None:
-                current.append(pt)
-            else:
-                if len(current) >= MIN_SEGMENT_LENGTH:
-                    segments.append(current)
-                current = []
-        if len(current) >= MIN_SEGMENT_LENGTH:
-            segments.append(current)
-        return segments
-    
-    def draw_segments(segments, img, color, thickness, orig_img=None, Minv=None,
-                      orig_thickness=5):
-        """Draw segments as fitted lines on BEV and reproject to original image.
-        
-        A linear fit through each segment's points produces a straight, clean line.
-        Multiple interpolated points are generated for smooth perspective reprojection.
-        """
-        count = 0
-        for seg in segments:
-            count += len(seg)
-            xs = np.array([p[0] for p in seg], dtype=np.float64)
-            ys = np.array([p[1] for p in seg], dtype=np.float64)
-            
-            # Linear fit: x = a*y + b
-            fit = np.polyfit(ys, xs, 1)
-            
-            # Generate smooth points along the fitted line
-            y_min, y_max = ys.min(), ys.max()
-            n_points = max(len(seg), 20)  # enough points for smooth reprojection
-            y_fitted = np.linspace(y_min, y_max, n_points)
-            x_fitted = np.polyval(fit, y_fitted)
-            
-            fitted_pts = np.column_stack([x_fitted, y_fitted]).astype(np.int32).reshape(-1, 1, 2)
-            cv2.polylines(img, [fitted_pts], isClosed=False, color=color, thickness=thickness)
-            
-            if orig_img is not None and Minv is not None:
-                fitted_float = np.column_stack([x_fitted, y_fitted]).astype(np.float32).reshape(-1, 1, 2)
-                orig_pts = cv2.perspectiveTransform(fitted_float, Minv)
-                cv2.polylines(orig_img, [orig_pts.astype(np.int32)],
-                              isClosed=False, color=color, thickness=orig_thickness)
-        return count
-    
-    left_segments = group_into_segments(left_points)
-    right_segments = group_into_segments(right_points)
-    
-    left_total = draw_segments(left_segments, bev_color, (0, 255, 0), 3,
-                               orig_img, Minv)
-    right_total = draw_segments(right_segments, bev_color, (0, 255, 0), 3,
-                                orig_img, Minv)
-    
-    # ── Count detected lanes ──
-    lanes_counted = 0
-    if left_total >= MIN_STRIP_DETECTIONS:
-        lanes_counted += 1
-    if right_total >= MIN_STRIP_DETECTIONS:
-        lanes_counted += 1
-    
-    if lanes_counted < 2:
-        text = "No lanes found" if lanes_counted == 0 else "One lane missing"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.0
-        text_thickness = 2
-        text_size = cv2.getTextSize(text, font, font_scale, text_thickness)[0]
-        text_x = (w - text_size[0]) // 2
-        text_y = 60
-        cv2.putText(bev_color, text, (text_x, text_y), font, font_scale,
-                    (255, 255, 255), text_thickness + 3, cv2.LINE_AA)
-        cv2.putText(bev_color, text, (text_x, text_y), font, font_scale,
-                    (0, 0, 255), text_thickness, cv2.LINE_AA)
-    
-    # Return full histogram for visualization
-    full_histogram = np.sum(binary_image, axis=0) / 255.0
-    return bev_color, full_histogram
+    left_half  = histogram[:midpoint]
+    right_half = histogram[midpoint:]
 
+    # Minimum peak to consider a lane present
+    min_peak = (h // 2) * 255.0 * MIN_PEAK_FRAC
+
+    has_left  = np.max(left_half)  > min_peak if len(left_half)  > 0 else False
+    has_right = np.max(right_half) > min_peak if len(right_half) > 0 else False
+
+    leftx_base  = int(np.argmax(left_half))              if has_left  else 0
+    rightx_base = int(np.argmax(right_half)) + midpoint  if has_right else w - 1
+
+    window_height = h // NWINDOWS
+    nonzero  = binary_warped.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+
+    leftx_current  = leftx_base
+    rightx_current = rightx_base
+
+    left_lane_inds  = []
+    right_lane_inds = []
+
+    for window in range(NWINDOWS):
+        win_y_low  = h - (window + 1) * window_height
+        win_y_high = h - window * window_height
+
+        if has_left:
+            xl_lo = leftx_current - SW_MARGIN
+            xl_hi = leftx_current + SW_MARGIN
+            good = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                    (nonzerox >= xl_lo)     & (nonzerox < xl_hi)).nonzero()[0]
+            left_lane_inds.append(good)
+            if len(good) > MINPIX:
+                leftx_current = int(np.mean(nonzerox[good]))
+
+        if has_right:
+            xr_lo = rightx_current - SW_MARGIN
+            xr_hi = rightx_current + SW_MARGIN
+            good = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                    (nonzerox >= xr_lo)     & (nonzerox < xr_hi)).nonzero()[0]
+            right_lane_inds.append(good)
+            if len(good) > MINPIX:
+                rightx_current = int(np.mean(nonzerox[good]))
+
+    left_lane_inds  = np.concatenate(left_lane_inds)  if left_lane_inds  else np.array([], dtype=int)
+    right_lane_inds = np.concatenate(right_lane_inds) if right_lane_inds else np.array([], dtype=int)
+
+    leftx  = nonzerox[left_lane_inds]  if len(left_lane_inds)  > 0 else np.array([])
+    lefty  = nonzeroy[left_lane_inds]  if len(left_lane_inds)  > 0 else np.array([])
+    rightx = nonzerox[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
+    righty = nonzeroy[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
+
+    return leftx, lefty, rightx, righty
+
+
+# ═══════════════════════════ Step 5b: Previous-Polynomial Search ═══════════════════════════
+
+def find_lane_pixels_prev_poly(binary_warped, prev_left_fit, prev_right_fit):
+    """
+    Search for lane pixels within ±margin of the polynomial from the previous frame.
+    Much faster than sliding windows; relies on temporal coherence between frames.
+    """
+    nonzero  = binary_warped.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    margin   = PREV_POLY_MARGIN
+
+    leftx = lefty = rightx = righty = np.array([])
+
+    if prev_left_fit is not None:
+        poly_x = prev_left_fit[0] * nonzeroy**2 + prev_left_fit[1] * nonzeroy + prev_left_fit[2]
+        inds = ((nonzerox > (poly_x - margin)) & (nonzerox < (poly_x + margin))).nonzero()[0]
+        if len(inds) > 0:
+            leftx = nonzerox[inds]
+            lefty = nonzeroy[inds]
+
+    if prev_right_fit is not None:
+        poly_x = prev_right_fit[0] * nonzeroy**2 + prev_right_fit[1] * nonzeroy + prev_right_fit[2]
+        inds = ((nonzerox > (poly_x - margin)) & (nonzerox < (poly_x + margin))).nonzero()[0]
+        if len(inds) > 0:
+            rightx = nonzerox[inds]
+            righty = nonzeroy[inds]
+
+    return leftx, lefty, rightx, righty
+
+
+# ═══════════════════════════ Step 6: Polynomial Fitting ═══════════════════════════
+
+def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
+    """
+    Fit 2nd-degree polynomials (x = ay² + by + c) to left and right lane pixels.
+    Returns fit coefficients, fitted x-values, and the y-linspace.
+    """
+    h = binary_warped.shape[0]
+    ploty = np.linspace(0, h - 1, h)
+
+    left_fit = right_fit = None
+    left_fitx = right_fitx = None
+
+    if len(lefty) > 0 and len(leftx) > 0:
+        try:
+            left_fit  = np.polyfit(lefty, leftx, 2)
+            left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
+        except (np.linalg.LinAlgError, TypeError):
+            pass
+
+    if len(righty) > 0 and len(rightx) > 0:
+        try:
+            right_fit  = np.polyfit(righty, rightx, 2)
+            right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+        except (np.linalg.LinAlgError, TypeError):
+            pass
+
+    return left_fit, right_fit, left_fitx, right_fitx, ploty
+
+
+# ═══════════════════════════ Step 7: Lane Type Classification ═══════════════════════════
+
+def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
+    """
+    Determine if a lane is SOLID or DASHED by checking pixel presence along the curve.
+    Returns the lane type and a list of (start_idx, end_idx) segments where marking is present.
+    These segments are used to draw dashed lines faithfully over the original markings.
+    """
+    h, w = binary_warped.shape
+    presence = np.zeros(len(ploty), dtype=bool)
+
+    for i in range(len(ploty)):
+        xi = int(round(fitx[i]))
+        yi = int(round(ploty[i]))
+        if 0 <= yi < h:
+            x_lo = max(0, xi - margin)
+            x_hi = min(w, xi + margin)
+            if x_lo < x_hi and np.any(binary_warped[yi, x_lo:x_hi] > 0):
+                presence[i] = True
+
+    coverage   = np.sum(presence) / len(presence) if len(presence) > 0 else 0
+    lane_type  = "solid" if coverage > SOLID_COVERAGE_THRESHOLD else "dashed"
+
+    # Group consecutive present y-indices into drawable segments
+    segments = []
+    start = None
+    for i in range(len(presence)):
+        if presence[i]:
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                segments.append((start, i - 1))
+                start = None
+    if start is not None:
+        segments.append((start, len(presence) - 1))
+
+    return lane_type, segments, coverage
+
+
+# ═══════════════════════════ Step 8: Curvature Measurement ═══════════════════════════
+
+def measure_curvature(left_fitx, right_fitx, ploty, ym_per_pix, xm_per_pix):
+    """Calculate average radius of curvature in meters at the bottom of the image."""
+    y_eval = np.max(ploty)
+    curvatures = []
+
+    for fitx in [left_fitx, right_fitx]:
+        if fitx is not None:
+            fit_cr = np.polyfit(ploty * ym_per_pix, fitx * xm_per_pix, 2)
+            R = ((1 + (2 * fit_cr[0] * y_eval * ym_per_pix + fit_cr[1])**2)**1.5
+                 / max(np.absolute(2 * fit_cr[0]), 1e-6))
+            curvatures.append(R)
+
+    return np.mean(curvatures) if curvatures else None
+
+
+# ═══════════════════════════ Step 9: Vehicle Position ═══════════════════════════
+
+def measure_position(binary_warped, left_fit, right_fit, xm_per_pix):
+    """Calculate vehicle lateral offset from lane center in meters."""
+    if left_fit is None or right_fit is None:
+        return None
+
+    y_max = binary_warped.shape[0]
+    w     = binary_warped.shape[1]
+
+    left_x  = left_fit[0]  * y_max**2 + left_fit[1]  * y_max + left_fit[2]
+    right_x = right_fit[0] * y_max**2 + right_fit[1] * y_max + right_fit[2]
+    center_lanes = (left_x + right_x) / 2.0
+
+    return (w / 2.0 - center_lanes) * xm_per_pix
+
+
+# ═══════════════════════════ Step 10: Drawing ═══════════════════════════
+
+def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
+                      left_fitx, right_fitx, M_inv,
+                      left_type, right_type,
+                      left_segments, right_segments,
+                      curvature, veh_pos):
+    """
+    Draw lane area (green fill) and individual lane lines on BEV and original image.
+    Solid lanes  → continuous green line along the full polynomial.
+    Dashed lanes → yellow segments drawn only where actual markings are detected.
+    """
+    h, w = binary_warped.shape
+
+    # ── Green fill between the two lanes (BEV + original) ──
+    if left_fitx is not None and right_fitx is not None:
+        warp_zero  = np.zeros((h, w), dtype=np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+        pts_left  = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+        pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+        pts = np.hstack((pts_left, pts_right))
+        cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0))
+
+        bev_color = cv2.addWeighted(bev_color, 1, color_warp, 0.3, 0)
+
+        newwarp  = cv2.warpPerspective(color_warp, M_inv, (orig_img.shape[1], orig_img.shape[0]))
+        orig_img = cv2.addWeighted(orig_img, 1, newwarp, 0.3, 0)
+
+    # ── Draw individual lane lines ──
+    def _draw_lane(fitx, segments, lane_type, bev_img, orig_img_ref):
+        if lane_type == "solid":
+            color = (0, 255, 0)
+            # Solid: draw the full polynomial as one continuous polyline
+            pts_bev = np.column_stack([fitx, ploty]).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(bev_img, [pts_bev], False, color, 3)
+            pts_f = np.column_stack([fitx, ploty]).astype(np.float32).reshape(-1, 1, 2)
+            pts_o = cv2.perspectiveTransform(pts_f, M_inv)
+            cv2.polylines(orig_img_ref, [pts_o.astype(np.int32)], False, color, 5)
+        else:
+            color = (0, 255, 255)   # yellow for dashed
+            # Dashed: draw only the segments where actual markings are detected
+            for (s, e) in segments:
+                if e - s < 2:
+                    continue
+                seg_x = fitx[s:e + 1]
+                seg_y = ploty[s:e + 1]
+                pts_bev = np.column_stack([seg_x, seg_y]).astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(bev_img, [pts_bev], False, color, 3)
+                pts_f = np.column_stack([seg_x, seg_y]).astype(np.float32).reshape(-1, 1, 2)
+                pts_o = cv2.perspectiveTransform(pts_f, M_inv)
+                cv2.polylines(orig_img_ref, [pts_o.astype(np.int32)], False, color, 5)
+
+    if left_fitx is not None:
+        _draw_lane(left_fitx, left_segments, left_type, bev_color, orig_img)
+    if right_fitx is not None:
+        _draw_lane(right_fitx, right_segments, right_type, bev_color, orig_img)
+
+    # ── Text overlay on original image ──
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    y_txt = 70
+    if curvature is not None:
+        cv2.putText(orig_img, f"Curve Radius: {curvature:.1f} m",
+                    (40, y_txt), font, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
+        y_txt += 50
+    if veh_pos is not None:
+        cv2.putText(orig_img, f"Center Offset: {veh_pos:.2f} m",
+                    (40, y_txt), font, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
+        y_txt += 50
+    if left_type:
+        cv2.putText(orig_img, f"Left: {left_type}",
+                    (40, y_txt), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        y_txt += 40
+    if right_type:
+        cv2.putText(orig_img, f"Right: {right_type}",
+                    (40, y_txt), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return bev_color, orig_img
+
+
+# ═══════════════════════════ Histogram Visualization ═══════════════════════════
 
 def draw_histogram(histogram, width, height):
-    """
-    Draws the column histogram as a 3-channel image for visualization.
-    """
+    """Draw column histogram as a 3-channel image for the debug panel."""
     hist_img = np.full((height, width, 3), 255, dtype=np.uint8)
-    
     max_val = np.max(histogram)
     if max_val == 0:
         return hist_img
-        
+
     scale = (height * 0.9) / max_val
-    
-    pts = []
-    for x, val in enumerate(histogram):
-        y = int(height - (val * scale))
-        pts.append([x, y])
-    
-    pts = np.array(pts, np.int32).reshape((-1, 1, 2))
-    cv2.polylines(hist_img, [pts], isClosed=False, color=(0, 0, 255), thickness=2)
-    
-    # Threshold line
-    actual_peak_threshold = height * PEAK_THRESHOLD_RATIO
-    peak_thresh_y = int(height - (actual_peak_threshold * scale))
-    cv2.line(hist_img, (0, peak_thresh_y), (width, peak_thresh_y),
-             (200, 200, 200), 1, cv2.LINE_AA)
-    
+    pts = np.array([[x, int(height - val * scale)] for x, val in enumerate(histogram)],
+                   np.int32).reshape((-1, 1, 2))
+    cv2.polylines(hist_img, [pts], False, (0, 0, 255), 2)
+
+    # Midpoint line
+    mid = width // 2
+    cv2.line(hist_img, (mid, 0), (mid, height), (180, 180, 180), 1, cv2.LINE_AA)
+
     return hist_img
 
 
+# ═══════════════════════════ Lane State (Frame Memory) ═══════════════════════════
+
+class LaneState:
+    """Stores polynomial fit history for temporal smoothing across frames."""
+
+    def __init__(self):
+        self.left_fit_history  = []
+        self.right_fit_history = []
+
+    @property
+    def has_history(self):
+        return len(self.left_fit_history) > 0 or len(self.right_fit_history) > 0
+
+    def get_averaged_fit(self):
+        """Return averaged polynomial coefficients from history."""
+        prev_left = prev_right = None
+        if self.left_fit_history:
+            prev_left = np.mean(np.array(self.left_fit_history), axis=0)
+        if self.right_fit_history:
+            prev_right = np.mean(np.array(self.right_fit_history), axis=0)
+        return prev_left, prev_right
+
+    def update(self, left_fit, right_fit):
+        """Add new fit to history; trim to HISTORY_LENGTH."""
+        if left_fit is not None:
+            self.left_fit_history.append(left_fit.copy())
+            if len(self.left_fit_history) > HISTORY_LENGTH:
+                self.left_fit_history.pop(0)
+        if right_fit is not None:
+            self.right_fit_history.append(right_fit.copy())
+            if len(self.right_fit_history) > HISTORY_LENGTH:
+                self.right_fit_history.pop(0)
+
+
+# ═══════════════════════════ Pipeline ═══════════════════════════
+
+def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
+                          bev_w, bev_h, state, ym_per_pix, xm_per_pix):
+    """
+    Full lane-detection pipeline for a single frame.
+    BEV → GOLD filter → geodesic dilation → binarize → detect → fit → classify → draw
+    """
+    display_frame = frame.copy()
+
+    # Step 1: Bird's-eye view
+    bev = cv2.warpPerspective(frame, perspective_matrix, (bev_w, bev_h))
+
+    # Step 2: GOLD differential filter
+    enhanced = enhance_lane_image(bev)
+
+    # Step 3: Geodesic dilation
+    dilated = geodesic_dilation(enhanced)
+
+    # Step 4: Local adaptive binarization
+    binary = binarize_image(dilated)
+
+    # Step 5: Find lane pixels
+    if not state.has_history:
+        leftx, lefty, rightx, righty = find_lane_pixels_histogram(binary)
+    else:
+        prev_left, prev_right = state.get_averaged_fit()
+        leftx, lefty, rightx, righty = find_lane_pixels_prev_poly(binary, prev_left, prev_right)
+        # Fallback to histogram if either side has no pixels
+        if len(lefty) == 0 or len(righty) == 0:
+            hx_l, hy_l, hx_r, hy_r = find_lane_pixels_histogram(binary)
+            if len(lefty) == 0:
+                leftx, lefty = hx_l, hy_l
+            if len(righty) == 0:
+                rightx, righty = hx_r, hy_r
+
+    # Step 6: Polynomial fitting
+    left_fit, right_fit, left_fitx, right_fitx, ploty = \
+        fit_polynomial(binary, leftx, lefty, rightx, righty)
+
+    # Step 7: Update frame history
+    state.update(left_fit, right_fit)
+
+    # Step 8: Classify lane types
+    left_type, left_segments = None, []
+    right_type, right_segments = None, []
+    if left_fitx is not None:
+        left_type, left_segments, _ = classify_lane_type(binary, left_fitx, ploty)
+    if right_fitx is not None:
+        right_type, right_segments, _ = classify_lane_type(binary, right_fitx, ploty)
+
+    # Step 9: Measurements
+    curvature = measure_curvature(left_fitx, right_fitx, ploty, ym_per_pix, xm_per_pix)
+    veh_pos   = measure_position(binary, left_fit, right_fit, xm_per_pix)
+
+    # Step 10: Draw overlays
+    bev_with_lanes, display_frame = draw_lane_overlay(
+        display_frame, bev.copy(), binary, ploty,
+        left_fitx, right_fitx, inv_matrix,
+        left_type, right_type,
+        left_segments, right_segments,
+        curvature, veh_pos
+    )
+
+    # Step 11: Handle missing lanes
+    lanes_count = (1 if left_fitx is not None else 0) + (1 if right_fitx is not None else 0)
+    if lanes_count < 2:
+        text = "No lanes found" if lanes_count == 0 else "One lane missing"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        ts   = cv2.getTextSize(text, font, 1.0, 2)[0]
+        tx   = (bev_w - ts[0]) // 2
+        cv2.putText(bev_with_lanes, text, (tx, 60), font, 1.0,
+                    (255, 255, 255), 4, cv2.LINE_AA)
+        cv2.putText(bev_with_lanes, text, (tx, 60), font, 1.0,
+                    (0, 0, 255), 2, cv2.LINE_AA)
+
+    # Histogram for debug panel
+    histogram    = np.sum(binary, axis=0) / 255.0
+    binary_color = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    return display_frame, bev_with_lanes, binary_color, histogram
+
+
+# ═══════════════════════════ Main ═══════════════════════════
+
 def main():
     parser = argparse.ArgumentParser(description="GOLD-inspired lane detection on front-camera images.")
-    parser.add_argument("path", type=str, help="Search path of the directory containing the images to be processed")
+    parser.add_argument("path", type=str,
+                        help="Search path of the directory containing the images to be processed")
     args = parser.parse_args()
 
     search_pattern = args.path
@@ -390,111 +590,121 @@ def main():
         search_pattern = os.path.join(search_pattern, "*.jpg")
 
     image_paths = sorted(glob.glob(search_pattern))
-    
     if not image_paths:
         print(f"Error: No images found matching '{args.path}'")
         sys.exit(1)
-        
+
     print(f"Found {len(image_paths)} images matching '{args.path}'")
 
-    window_combined = f"Result ({search_pattern})"
-    cv2.namedWindow(window_combined, cv2.WINDOW_NORMAL)
-    
+    window_name = f"Result ({search_pattern})"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # Perspective transform
     perspective_matrix, inv_matrix, roi_polygon, bev_w, bev_h = get_perspective_transformation()
-    
+
+    # Pixel-to-meter conversion from ROI parameters
+    ym_per_pix = (DIST_AHEAD - BOTTOM_OFFSET) / bev_h
+    xm_per_pix = (2 * SPACE_TO_ONE_SIDE) / bev_w
+
+    # Frame memory
+    state = LaneState()
+
     for img_path in image_paths:
         frame = cv2.imread(img_path)
         if frame is None:
             print(f"Warning: Could not read image {img_path}")
             continue
-            
-        display_frame = frame.copy()
-        cv2.polylines(display_frame, [roi_polygon.reshape((-1, 1, 2))], True, (0, 0, 255), 3)
-        
-        bev = cv2.warpPerspective(frame, perspective_matrix, (bev_w, bev_h))
-        
-        bev_enhanced = enhance_lane_image(bev)
-        bev_binary = binarize_image(bev_enhanced)
-        
-        bev_with_lanes, histogram = extract_lane_characteristics(
-            bev_binary, bev.copy(), orig_img=display_frame, Minv=inv_matrix
+
+        # ── Run pipeline ──
+        display_frame, bev_with_lanes, binary_color, histogram = lane_finding_pipeline(
+            frame, perspective_matrix, inv_matrix, bev_w, bev_h,
+            state, ym_per_pix, xm_per_pix
         )
-        
-        hist_img = draw_histogram(histogram, bev_w, bev_h)
-        
-        # ── Add legend to original image ──
-        cv2.rectangle(display_frame, (10, 10), (320, 100), (0, 0, 0), -1)
-        cv2.rectangle(display_frame, (10, 10), (320, 100), (100, 100, 100), 2)
-        # ROI legend
+
+        # ── ROI polygon on original ──
+        cv2.polylines(display_frame, [roi_polygon.reshape((-1, 1, 2))], True, (0, 0, 255), 3)
+
+        # ── Legend ──
+        cv2.rectangle(display_frame, (10, 10), (380, 175), (0, 0, 0), -1)
+        cv2.rectangle(display_frame, (10, 10), (380, 175), (100, 100, 100), 2)
+        font_leg = cv2.FONT_HERSHEY_SIMPLEX
+        # ROI
         cv2.line(display_frame, (25, 40), (65, 40), (0, 0, 255), 4)
-        cv2.putText(display_frame, "ROI", (80, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        # Lane legend
-        cv2.line(display_frame, (25, 78), (65, 78), (0, 255, 0), 4)
-        cv2.putText(display_frame, "Detected lanes", (80, 86),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        
-        bev_binary_color = cv2.cvtColor(bev_binary, cv2.COLOR_GRAY2BGR)
-        
+        cv2.putText(display_frame, "ROI", (80, 48), font_leg, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        # Solid lane
+        cv2.line(display_frame, (25, 75), (65, 75), (0, 255, 0), 4)
+        cv2.putText(display_frame, "Solid lane", (80, 83), font_leg, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        # Dashed lane (3 short dashes)
+        cv2.line(display_frame, (25, 110), (37, 110), (0, 255, 255), 4)
+        cv2.line(display_frame, (42, 110), (54, 110), (0, 255, 255), 4)
+        cv2.line(display_frame, (59, 110), (65, 110), (0, 255, 255), 4)
+        cv2.putText(display_frame, "Dashed lane", (80, 118), font_leg, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        # Lane area
+        cv2.rectangle(display_frame, (25, 137), (65, 157), (0, 255, 0), -1)
+        cv2.putText(display_frame, "Lane area", (80, 153), font_leg, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        # ── Histogram panel ──
+        hist_img = draw_histogram(histogram, bev_w, bev_h)
+
         # ── Build titled panels ──
-        title_h = 40
-        sep_w = 12
-        font = cv2.FONT_HERSHEY_SIMPLEX
+        title_h    = 40
+        sep_w      = 12
+        font_t     = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.7
         font_thick = 2
-        title_color = (240, 240, 240)
-        bg_color = (40, 40, 40)
-        
+        title_clr  = (240, 240, 240)
+        bg_clr     = (40, 40, 40)
+
         panels = [
-            ("Original", display_frame),
+            ("Original",   display_frame),
             ("BEV + Lanes", bev_with_lanes),
-            ("Binary", bev_binary_color),
-            ("Histogram", hist_img),
+            ("Binary",     binary_color),
+            ("Histogram",  hist_img),
         ]
-        
-        titled_panels = []
+
+        titled = []
         for title, panel in panels:
-            # Create title bar
-            title_bar = np.full((title_h, panel.shape[1], 3), bg_color, dtype=np.uint8)
-            text_size = cv2.getTextSize(title, font, font_scale, font_thick)[0]
-            text_x = (panel.shape[1] - text_size[0]) // 2
-            text_y = (title_h + text_size[1]) // 2
-            cv2.putText(title_bar, title, (text_x, text_y), font, font_scale,
-                        title_color, font_thick, cv2.LINE_AA)
-            titled_panels.append(np.vstack([title_bar, panel]))
-        
-        # Separators between panels
-        total_h = titled_panels[0].shape[0]
-        separator = np.full((total_h, sep_w, 3), bg_color, dtype=np.uint8)
-        
-        parts = [titled_panels[0]]
-        for tp in titled_panels[1:]:
+            bar = np.full((title_h, panel.shape[1], 3), bg_clr, dtype=np.uint8)
+            ts  = cv2.getTextSize(title, font_t, font_scale, font_thick)[0]
+            tx  = (panel.shape[1] - ts[0]) // 2
+            ty  = (title_h + ts[1]) // 2
+            cv2.putText(bar, title, (tx, ty), font_t, font_scale,
+                        title_clr, font_thick, cv2.LINE_AA)
+            titled.append(np.vstack([bar, panel]))
+
+        total_h   = titled[0].shape[0]
+        separator = np.full((total_h, sep_w, 3), bg_clr, dtype=np.uint8)
+
+        parts = [titled[0]]
+        for tp in titled[1:]:
             parts.append(separator)
             parts.append(tp)
-        
-        combined_display = cv2.hconcat(parts)
-        
-        display_scale = 0.4
-        resized_display = cv2.resize(combined_display, None, fx=display_scale, fy=display_scale)
-        
-        cv2.imshow(window_combined, resized_display)
-        
+
+        combined = cv2.hconcat(parts)
+        resized  = cv2.resize(combined, None, fx=0.4, fy=0.4)
+
+        cv2.imshow(window_name, resized)
+
         key = cv2.waitKey(100) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
-            
-        if cv2.getWindowProperty(window_combined, cv2.WND_PROP_AUTOSIZE) == -1.0:
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) == -1.0:
             print("Window closed by user.")
             break
-            
+
     print("Playback finished. Press any key to close the window.")
     try:
-        if cv2.getWindowProperty(window_combined, cv2.WND_PROP_AUTOSIZE) != -1.0:
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) != -1.0:
             cv2.waitKey(0)
     except:
         pass
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
