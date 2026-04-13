@@ -4,6 +4,7 @@ import cv2
 import sys
 import os
 import numpy as np
+from ultralytics import YOLO
 
 # Camera intrinsics and extrinsics
 IMAGE_SIZE      = np.array([1920, 1080])
@@ -39,6 +40,27 @@ HISTORY_LENGTH = 4
 # Lane type classification thresholds
 SOLID_COVERAGE_THRESHOLD = 0.55
 LANE_CHECK_MARGIN        = 15
+
+# ═══════════════════════════ Tunable Algorithm Parameters ═══════════════════════════
+TARGET_LANE_WIDTH_M       = 3.7
+LANE_PHYSICAL_WIDTH_M     = 4.6
+
+BIN_THRESHOLD_TOLERANCE   = 0.5
+MORPH_CLOSE_KERNEL        = (1, 30)
+MORPH_OPEN_KERNEL         = (3, 50)
+
+HIST_SEARCH_MARGIN_FRAC   = 0.1
+
+POLY_MIN_PIXELS           = 200
+POLY_MIN_HEIGHT_FRAC      = 0.3
+POLY_MAX_CURVATURE        = 0.001
+
+LANE_MIN_WIDTH_FRAC       = 0.25
+LANE_MIN_AVG_WIDTH_FRAC   = 0.3
+LANE_MAX_AVG_WIDTH_FRAC   = 0.7
+LANE_MAX_WIDTH_DIFF_FRAC  = 0.25
+
+DASHED_MIN_DRAW_SEGMENT   = 40
 
 
 # ═══════════════════════════ Step 1: Perspective Transform ═══════════════════════════
@@ -125,7 +147,7 @@ def binarize_image(blurred_image):
 
         new_threshold = (g_A + g_B) / 2.0
 
-        if abs(threshold - new_threshold) < 0.5:
+        if abs(threshold - new_threshold) < BIN_THRESHOLD_TOLERANCE:
             threshold = new_threshold
             break
         threshold = new_threshold
@@ -135,12 +157,12 @@ def binarize_image(blurred_image):
 
     # 1. Morphological Closing (collega verticalmente i segmenti spezzati)
     # Un kernel (1, 30) unisce i pixel bianchi vicini verticalmente senza allargarli.
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_CLOSE_KERNEL)
     binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_CLOSE, kernel_close)
 
     # 2. Morphological Opening (rimuove il rumore sparso o orizzontale)
     # Ora puoi usare un kernel più robusto, ad esempio 40 o 50, e la linea non sparirà.
-    kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 40))
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_OPEN_KERNEL)
     binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel_open)
 
     return binary_image
@@ -154,8 +176,8 @@ def find_lane_pixels_histogram(binary_warped):
     histogram = np.sum(binary_warped[h // 2:, :], axis=0).astype(np.float64)
 
     # Zero out the image center and extreme edges to ignore the vehicle hood and boundaries
-    edge_margin   = int(w * 0.1)
-    center_margin = int(w * 0.1)
+    edge_margin   = int(w * HIST_SEARCH_MARGIN_FRAC)
+    center_margin = int(w * HIST_SEARCH_MARGIN_FRAC)
     midpoint      = w // 2
 
     histogram[:edge_margin]  = 0
@@ -261,22 +283,22 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
     left_fitx = right_fitx = None
 
     # Require enough pixels spread across at least 30% of the image height before fitting
-    if len(lefty) > 200 and len(leftx) > 0:
-        if (np.max(lefty) - np.min(lefty)) >= h * 0.3:
+    if len(lefty) > POLY_MIN_PIXELS and len(leftx) > 0:
+        if (np.max(lefty) - np.min(lefty)) >= h * POLY_MIN_HEIGHT_FRAC:
             try:
                 fit = np.polyfit(lefty, leftx, 2)
                 # Reject physically implausible curvature
-                if abs(fit[0]) <= 0.001:
+                if abs(fit[0]) <= POLY_MAX_CURVATURE:
                     left_fit  = fit
                     left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
             except (np.linalg.LinAlgError, TypeError):
                 pass
 
-    if len(righty) > 200 and len(rightx) > 0:
-        if (np.max(righty) - np.min(righty)) >= h * 0.3:
+    if len(righty) > POLY_MIN_PIXELS and len(rightx) > 0:
+        if (np.max(righty) - np.min(righty)) >= h * POLY_MIN_HEIGHT_FRAC:
             try:
                 fit = np.polyfit(righty, rightx, 2)
-                if abs(fit[0]) <= 0.001:
+                if abs(fit[0]) <= POLY_MAX_CURVATURE:
                     right_fit  = fit
                     right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
             except (np.linalg.LinAlgError, TypeError):
@@ -294,21 +316,21 @@ def is_valid_lane(left_fitx, right_fitx, bev_w):
 
     widths = right_fitx - left_fitx
 
-    if np.any(widths < bev_w * 0.25):
+    if np.any(widths < bev_w * LANE_MIN_WIDTH_FRAC):
         return False
 
     avg_width = np.mean(widths)
-    if not (0.3 * bev_w <= avg_width <= 0.7 * bev_w):
+    if not (LANE_MIN_AVG_WIDTH_FRAC * bev_w <= avg_width <= LANE_MAX_AVG_WIDTH_FRAC * bev_w):
         return False
 
     # The lane width should not vary too much between the top and bottom of the image
     width_top    = widths[0]
     width_bottom = widths[-1]
 
-    target_lane_width = bev_w * (3.7 / 4.6)
+    target_lane_width = bev_w * (TARGET_LANE_WIDTH_M / LANE_PHYSICAL_WIDTH_M)
     diff = abs(width_top - width_bottom)
 
-    if diff > 0.25 * target_lane_width:
+    if diff > LANE_MAX_WIDTH_DIFF_FRAC * target_lane_width:
         return False
 
     return True
@@ -388,7 +410,7 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
             color = (0, 255, 255)
             # For dashed lanes, only draw segments where actual markings were detected
             for (s, e) in segments:
-                if e - s < 40:
+                if e - s < DASHED_MIN_DRAW_SEGMENT:
                     continue
                 seg_x   = fitx[s:e + 1]
                 seg_y   = ploty[s:e + 1]
@@ -498,7 +520,7 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
 
     left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(binary, leftx, lefty, rightx, righty)
 
-    target_lane_width = bev_w * (3.7 / 4.6)
+    target_lane_width = bev_w * (TARGET_LANE_WIDTH_M / LANE_PHYSICAL_WIDTH_M)
     draw_polygon      = False
 
     # When both lanes are detected, validate the pair together.
@@ -566,7 +588,66 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
     histogram    = np.sum(binary, axis=0) / 255.0
     binary_color = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
-    return display_frame, bev_with_lanes, binary_color, histogram
+    return display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty
+
+
+# ═══════════════════════════ Step 11: Obstacle Detection ═══════════════════════════
+
+def detect_obstacles(display_frame, yolo_model, roi_polygon):
+    """Detect obstacles on the original image, calculate distance, and filter by ROI overlap."""
+    # Process YOLO inference for classes: 0 (person), 2 (car), 3 (motorcycle), 5 (bus), 7 (truck)
+    results = yolo_model(display_frame, classes=[0, 2, 3, 5, 7], verbose=False)
+    
+    h, w = display_frame.shape[:2]
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [roi_polygon.reshape((-1, 1, 2))], 255)
+    
+    for r in results:
+        boxes = r.boxes
+        if boxes is None:
+            continue
+            
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = box.conf[0].cpu().numpy()
+            cls = int(box.cls[0].cpu().numpy())
+            
+            # Bottom-center point of the bounding box
+            u = (x1 + x2) / 2.0
+            v = y2
+            
+            # Only estimate distance if the point is below the horizon
+            if v <= PRINCIPAL_POINT[1]:
+                continue
+                
+            # Euclidean distance on the ground plane
+            z_dist = (FOCAL_LENGTH[1] * HEIGHT) / (v - PRINCIPAL_POINT[1])
+            x_dist = (u - PRINCIPAL_POINT[0]) * z_dist / FOCAL_LENGTH[0]
+            distance = np.sqrt(x_dist**2 + z_dist**2)
+            
+            # Filter by ROI overlap
+            ix1, iy1 = int(max(0, x1)), int(max(0, y1))
+            ix2, iy2 = int(min(w, x2)), int(min(h, y2))
+            
+            if ix1 >= ix2 or iy1 >= iy2:
+                continue
+                
+            overlap = roi_mask[iy1:iy2, ix1:ix2]
+            if not np.any(overlap):
+                continue
+                
+            # Draw bounding box and label
+            clr = (0, 165, 255) # Orange for obstacles
+            cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), clr, 2)
+            
+            label = f"{yolo_model.names[cls]} {distance:.1f}m"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            ts = cv2.getTextSize(label, font, 0.6, 2)[0]
+            
+            cv2.rectangle(display_frame, (int(x1), int(y1) - ts[1] - 10), (int(x1) + ts[0] + 4, int(y1)), clr, -1)
+            cv2.putText(display_frame, label, (int(x1) + 2, int(y1) - 5), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                
+    return display_frame
 
 
 # ═══════════════════════════ Main ═══════════════════════════
@@ -596,14 +677,22 @@ def main():
 
     state = LaneState()
 
+    # Load YOLO model
+    print("Loading YOLOv8 nano model...")
+    yolo_model = YOLO("yolov8n.pt")
+
     for img_path in image_paths:
         frame = cv2.imread(img_path)
         if frame is None:
             print(f"Warning: Could not read image {img_path}")
             continue
 
-        display_frame, bev_with_lanes, binary_color, histogram = lane_finding_pipeline(
+        display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty = lane_finding_pipeline(
             frame, perspective_matrix, inv_matrix, bev_w, bev_h, state
+        )
+
+        display_frame = detect_obstacles(
+            display_frame, yolo_model, roi_polygon
         )
 
         cv2.polylines(display_frame, [roi_polygon.reshape((-1, 1, 2))], True, (0, 0, 255), 3)
