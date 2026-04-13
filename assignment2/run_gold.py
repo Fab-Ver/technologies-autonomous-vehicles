@@ -34,7 +34,7 @@ MIN_PEAK_FRAC   = 0.03 # histogram peak must exceed this fraction of max possibl
 PREV_POLY_MARGIN = 25
 
 # Number of past frames kept for temporal smoothing
-HISTORY_LENGTH = 10
+HISTORY_LENGTH = 4 
 
 # Lane type classification thresholds
 SOLID_COVERAGE_THRESHOLD = 0.55
@@ -85,6 +85,7 @@ def get_perspective_transformation():
 def enhance_lane_image(bev_image, d_values=GOLD_FILTER_D_VALUES):
     """Highlight lane markings by applying a multi-scale differential edge filter."""
     gray    = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
+
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     f       = blurred.astype(np.float32)
 
@@ -132,10 +133,15 @@ def binarize_image(blurred_image):
     binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
     binary_image[blurred_image >= threshold] = 255
 
-    # Morphological opening with a tall vertical kernel removes horizontal noise
-    # while preserving vertically elongated lane markings
-    kernel       = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 80))
-    binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel)
+    # 1. Morphological Closing (collega verticalmente i segmenti spezzati)
+    # Un kernel (1, 30) unisce i pixel bianchi vicini verticalmente senza allargarli.
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_CLOSE, kernel_close)
+
+    # 2. Morphological Opening (rimuove il rumore sparso o orizzontale)
+    # Ora puoi usare un kernel più robusto, ad esempio 40 o 50, e la linea non sparirà.
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 40))
+    binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel_open)
 
     return binary_image
 
@@ -447,7 +453,7 @@ class LaneState:
         """Push new fits into the history, and clear it if too many consecutive frames were missed."""
         if left_fit is None and right_fit is None:
             self.missed_frames += 1
-            if self.missed_frames > 5:
+            if self.missed_frames > 1:
                 self.left_fit_history.clear()
                 self.right_fit_history.clear()
         else:
@@ -490,8 +496,7 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
             if len(righty) == 0:
                 rightx, righty = hx_r, hy_r
 
-    left_fit, right_fit, left_fitx, right_fitx, ploty = \
-        fit_polynomial(binary, leftx, lefty, rightx, righty)
+    left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(binary, leftx, lefty, rightx, righty)
 
     target_lane_width = bev_w * (3.7 / 4.6)
     draw_polygon      = False
