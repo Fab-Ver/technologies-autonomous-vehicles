@@ -25,15 +25,16 @@ GOLD_FILTER_D_VALUES = [4, 6, 8, 10]
 
 # ── Sliding window lane search ──
 NWINDOWS      = 9
-SW_MARGIN     = 45
-MINPIX        = 50
+SW_MARGIN     = 25
+MAX_LANE_SPREAD = 40   # maximum horizontal width (px) allowed for a valid lane marking
+MINPIX        = 90
 MIN_PEAK_FRAC = 0.03   # minimum histogram peak to consider a lane present
 
 # ── Previous-polynomial search ──
-PREV_POLY_MARGIN = 45
+PREV_POLY_MARGIN = 25
 
 # ── Frame history for temporal smoothing ──
-HISTORY_LENGTH = 1
+HISTORY_LENGTH = 10
 
 # ── Lane type classification ──
 SOLID_COVERAGE_THRESHOLD = 0.55
@@ -138,7 +139,7 @@ def binarize_image(blurred_image):
     binary_image[blurred_image >= threshold] = 255
     
     # Filtraggio Morfologico Direzionale (Opening con kernel verticale)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 30))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 80))
     binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel)
     
     return binary_image
@@ -195,18 +196,22 @@ def find_lane_pixels_histogram(binary_warped):
             xl_hi = leftx_current + SW_MARGIN
             good = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
                     (nonzerox >= xl_lo)     & (nonzerox < xl_hi)).nonzero()[0]
-            left_lane_inds.append(good)
-            if len(good) > MINPIX:
-                leftx_current = int(np.mean(nonzerox[good]))
+            if len(good) > 0:
+                if (np.max(nonzerox[good]) - np.min(nonzerox[good])) <= MAX_LANE_SPREAD:
+                    left_lane_inds.append(good)
+                    if len(good) > MINPIX:
+                        leftx_current = int(np.mean(nonzerox[good]))
 
         if has_right:
             xr_lo = rightx_current - SW_MARGIN
             xr_hi = rightx_current + SW_MARGIN
             good = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
                     (nonzerox >= xr_lo)     & (nonzerox < xr_hi)).nonzero()[0]
-            right_lane_inds.append(good)
-            if len(good) > MINPIX:
-                rightx_current = int(np.mean(nonzerox[good]))
+            if len(good) > 0:
+                if (np.max(nonzerox[good]) - np.min(nonzerox[good])) <= MAX_LANE_SPREAD:
+                    right_lane_inds.append(good)
+                    if len(good) > MINPIX:
+                        rightx_current = int(np.mean(nonzerox[good]))
 
     left_lane_inds  = np.concatenate(left_lane_inds)  if left_lane_inds  else np.array([], dtype=int)
     right_lane_inds = np.concatenate(right_lane_inds) if right_lane_inds else np.array([], dtype=int)
@@ -545,7 +550,8 @@ def lane_finding_pipeline(frame, perspective_matrix, inv_matrix,
     if left_fitx is not None and right_fitx is not None:
         if not is_valid_lane(left_fitx, right_fitx, bev_w):
             # Previene il suicidio di coppia: scarta solo la linea meno affidabile
-            if len(lefty) < len(righty):
+            # La linea con minore curvatura (abs(fit[0])) è solitamente quella corretta (non deviata)
+            if abs(left_fit[0]) > abs(right_fit[0]):
                 left_fit = left_fitx = None
             else:
                 right_fit = right_fitx = None
