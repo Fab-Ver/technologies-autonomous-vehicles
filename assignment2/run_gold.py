@@ -33,7 +33,7 @@ NWINDOWS        = 9
 SW_MARGIN       = 25
 MAX_LANE_SPREAD = 40   # reject windows whose detected pixels span more than this width in px
 MINPIX          = 90
-MIN_PEAK_FRAC   = 0.03 # histogram peak must exceed this fraction of max possible value
+MIN_PEAK_FRAC   = 0.06 # histogram peak must exceed this fraction of max possible value
 
 # Search band half-width when using a previously fitted polynomial
 PREV_POLY_MARGIN = 25
@@ -58,14 +58,20 @@ HIST_SEARCH_MARGIN_FRAC_CENTER = 0.15
 
 POLY_MIN_PIXELS           = 200
 POLY_MIN_HEIGHT_FRAC      = 0.3
-POLY_MAX_CURVATURE        = 0.001
+POLY_MAX_CURVATURE        = 0.003
 
 LANE_MIN_WIDTH_FRAC       = 0.25
 LANE_MIN_AVG_WIDTH_FRAC   = 0.3
 LANE_MAX_AVG_WIDTH_FRAC   = 0.7
-LANE_MAX_WIDTH_DIFF_FRAC  = 0.25
+LANE_MAX_WIDTH_DIFF_FRAC  = 0.45
 
 DASHED_MIN_DRAW_SEGMENT   = 40
+
+POLY_MAX_SLOPE = 0.8        # maximum acceptable linear coefficient b (slope)
+POLY_MAX_INTERCEPT_DEVIATION = BEV_WIDTH * 0.6  # c must not place the line outside the image
+
+LANE_MAX_A_DIFF = 0.001   
+LANE_MAX_B_DIFF = 0.4 
 
 def get_perspective_transformation():
     """Compute the IPM homography from camera parameters and ROI definition."""
@@ -117,8 +123,16 @@ def enhance_lanes(bev_image, d_values=GOLD_FILTER_D_VALUES):
         g = np.minimum(diff_left, diff_right)
         g[g < 0] = 0
         result = np.maximum(result, g)
+    
+    if result.max() > 0:
+        result = (result / result.max() * 255.0)
+    
+    result_u8 = result.astype(np.uint8)
 
-    return result.astype(np.uint8)
+    kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1,15))
+    result_u8   = cv2.morphologyEx(result_u8, cv2.MORPH_OPEN, kernel_vert)
+
+    return result_u8
 
 def binarized_image(blurred_image):
     """Binarize the enhanced image using an iterative threshold that converges on the mean of the two region means."""
@@ -179,14 +193,21 @@ def find_lane_pixels_histogram(binary_warped):
     # Calculate the minimum value a histogram peak must have to be considered a valid lane line.
     min_peak = (h // 2) * 255.0 * MIN_PEAK_FRAC
 
+    max_left = np.max(left_half)  if len(left_half)  > 0 else 0
+    max_right = np.max(right_half) if len(right_half) > 0 else 0
+
     # Check if the highest peaks in the left and right halves are strong enough to be actual lines
-    has_left  = np.max(left_half)  > min_peak if len(left_half)  > 0 else False
-    has_right = np.max(right_half) > min_peak if len(right_half) > 0 else False
+    has_left  = max_left  > min_peak
+    has_right = max_right > min_peak 
+
+    # If no peak is strong enough on either side, return immediately with empty arrays
+    if not has_left and not has_right:
+        return np.array([]), np.array([]), np.array([]), np.array([])
 
     # Find the x-coordinates of the starting points (bases) for the left and right lines.
     # If the peak is too weak, default to the extreme image edges.
-    leftx_base  = int(np.argmax(left_half))             if has_left  else 0
-    rightx_base = int(np.argmax(right_half)) + midpoint if has_right else w - 1
+    leftx_base  = int(np.argmax(left_half))             if has_left  else None
+    rightx_base = int(np.argmax(right_half)) + midpoint if has_right else None
 
     # Define the height of a single sliding window
     window_height = h // NWINDOWS
@@ -197,8 +218,8 @@ def find_lane_pixels_histogram(binary_warped):
     nonzerox      = np.array(nonzero[1])
 
     # Initialize current x positions to be updated for each window iteration
-    leftx_current  = leftx_base
-    rightx_current = rightx_base
+    leftx_current  = leftx_base if has_left  else None
+    rightx_current = rightx_base if has_right else None
 
     left_lane_inds  = []
     right_lane_inds = []
@@ -209,7 +230,7 @@ def find_lane_pixels_histogram(binary_warped):
         win_y_low  = h - (window + 1) * window_height
         win_y_high = h - window * window_height
 
-        if has_left:
+        if has_left and leftx_current is not None:
             # Identify window boundaries in x
             xl_lo = leftx_current - SW_MARGIN
             xl_hi = leftx_current + SW_MARGIN
@@ -219,13 +240,21 @@ def find_lane_pixels_histogram(binary_warped):
                      (nonzerox >= xl_lo)     & (nonzerox < xl_hi)).nonzero()[0]
                      
             if len(good_left) > 0:
-                left_lane_inds.append(good_left)
+                # Discard windows where detected pixels are too widely spread, as they likely contain noise or multiple lines
+                spread = np.max(nonzerox[good_left]) - np.min(nonzerox[good_left])
+                if spread <= MAX_LANE_SPREAD:
+                    left_lane_inds.append(good_left)
                     
-                # If enough pixels are found, update the center of the next window to track line curvature
-                if len(good_left) > MINPIX:
-                    leftx_current = int(np.median(nonzerox[good_left]))
+                    # If enough pixels are found, update the center of the next window to track line curvature
+                    if len(good_left) > MINPIX:
+                        leftx_current = int(np.median(nonzerox[good_left]))
+                else:        
+                    # Noisy window: do not accept pixels, but nudge center slightly
+                    # toward the window centroid to avoid getting stuck in one position
+                    nudge         = int(np.median(nonzerox[good_left]))
+                    leftx_current = int(0.85 * leftx_current + 0.15 * nudge)
 
-        if has_right:
+        if has_right and rightx_current is not None:
             xr_lo = rightx_current - SW_MARGIN
             xr_hi = rightx_current + SW_MARGIN
             
@@ -233,8 +262,14 @@ def find_lane_pixels_histogram(binary_warped):
                      (nonzerox >= xr_lo)     & (nonzerox < xr_hi)).nonzero()[0]
                      
             if len(good_right) > 0:
-                if len(good_right) > MINPIX:
-                    rightx_current = int(np.median(nonzerox[good_right]))
+                spread = np.max(nonzerox[good_right]) - np.min(nonzerox[good_right])
+                if spread <= MAX_LANE_SPREAD:
+                    right_lane_inds.append(good_right)
+                    if len(good_right) > MINPIX:
+                        rightx_current = int(np.median(nonzerox[good_right]))
+                else:       
+                    nudge         = int(np.median(nonzerox[good_right]))
+                    rightx_current = int(0.85 * rightx_current + 0.15 * nudge)
 
     left_lane_inds  = np.concatenate(left_lane_inds)  if left_lane_inds  else np.array([], dtype=int)
     right_lane_inds = np.concatenate(right_lane_inds) if right_lane_inds else np.array([], dtype=int)
@@ -276,25 +311,37 @@ def find_lane_pixels_prev_poly(binary_warped, prev_left_fit, prev_right_fit):
     return leftx, lefty, rightx, righty
 
 
-# ═══════════════════════════ Step 6: Polynomial Fitting ═══════════════════════════
-
 def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
-    """Fit a second-degree polynomial (x = ay^2 + by + c) to each set of lane pixels."""
+    """Fit a second-degree polynomial (x = ay^2 + by + c) to each set of lane pixels.
+    
+    Validates each fit against three geometric constraints:
+      - curvature  (a): must not exceed POLY_MAX_CURVATURE
+      - slope      (b): must not exceed POLY_MAX_SLOPE
+      - position   (c): the curve's bottom-most x must lie within the BEV image width
+    """
     h     = binary_warped.shape[0]
     ploty = np.linspace(0, h - 1, h)
 
-    left_fit = right_fit = None
+    left_fit  = right_fit  = None
     left_fitx = right_fitx = None
 
-    # Require enough pixels spread across at least 30% of the image height before fitting
+    # Require enough pixels spread across at least POLY_MIN_HEIGHT_FRAC of the image height before fitting
     if len(lefty) > POLY_MIN_PIXELS and len(leftx) > 0:
         if (np.max(lefty) - np.min(lefty)) >= h * POLY_MIN_HEIGHT_FRAC:
             try:
                 fit = np.polyfit(lefty, leftx, 2)
-                # Reject physically implausible curvature
-                if abs(fit[0]) <= POLY_MAX_CURVATURE:
+                a, b, c = fit
+
+                # Evaluate where the curve sits at the bottom of the image (highest y value)
+                bottom_x = a * (h - 1)**2 + b * (h - 1) + c
+
+                # Accept the fit only if curvature, slope, and bottom position are all plausible
+                if (abs(a) <= POLY_MAX_CURVATURE
+                        and abs(b) <= POLY_MAX_SLOPE
+                        and 0 <= bottom_x <= BEV_WIDTH):
                     left_fit  = fit
-                    left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
+                    left_fitx = a * ploty**2 + b * ploty + c
+
             except (np.linalg.LinAlgError, TypeError):
                 pass
 
@@ -302,18 +349,25 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
         if (np.max(righty) - np.min(righty)) >= h * POLY_MIN_HEIGHT_FRAC:
             try:
                 fit = np.polyfit(righty, rightx, 2)
-                if abs(fit[0]) <= POLY_MAX_CURVATURE:
+                a, b, c = fit
+
+                # Same geometric validation applied symmetrically to the right lane
+                bottom_x = a * (h - 1)**2 + b * (h - 1) + c
+
+                if (abs(a) <= POLY_MAX_CURVATURE
+                        and abs(b) <= POLY_MAX_SLOPE
+                        and 0 <= bottom_x <= BEV_WIDTH):
                     right_fit  = fit
-                    right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+                    right_fitx = a * ploty**2 + b * ploty + c
+
             except (np.linalg.LinAlgError, TypeError):
                 pass
 
     return left_fit, right_fit, left_fitx, right_fitx, ploty
 
 
-# ═══════════════════════════ Step 6b: Sanity Checks ═══════════════════════════
 
-def is_valid_lane(left_fitx, right_fitx, bev_w):
+def is_valid_lane(left_fitx, right_fitx, bev_w, left_fit=None, right_fit=None):
     """Verify that the fitted lane pair has a plausible and consistent width."""
     if left_fitx is None or right_fitx is None:
         return True
@@ -336,6 +390,12 @@ def is_valid_lane(left_fitx, right_fitx, bev_w):
 
     if diff > LANE_MAX_WIDTH_DIFF_FRAC * target_lane_width:
         return False
+    
+    if left_fit is not None and right_fit is not None:
+        if abs(left_fit[0] - right_fit[0]) > LANE_MAX_A_DIFF:
+            return False
+        if abs(left_fit[1] - right_fit[1]) > LANE_MAX_B_DIFF:
+            return False
 
     return True
 
@@ -460,7 +520,8 @@ class LaneState:
     def __init__(self):
         self.left_fit_history  = []
         self.right_fit_history = []
-        self.missed_frames     = 0
+        self.left_missed     = 0
+        self.right_missed    = 0
 
     @property
     def has_history(self):
@@ -477,19 +538,22 @@ class LaneState:
 
     def update(self, left_fit=None, right_fit=None):
         """Push new fits into the history, and clear it if too many consecutive frames were missed."""
-        if left_fit is None and right_fit is None:
-            self.missed_frames += 1
-            if self.missed_frames > 1:
+        if left_fit is None:
+            self.left_missed += 1
+            if self.left_missed > 3:
                 self.left_fit_history.clear()
-                self.right_fit_history.clear()
         else:
-            self.missed_frames = 0
-
-        if left_fit is not None:
+            self.left_missed = 0
             self.left_fit_history.append(left_fit.copy())
             if len(self.left_fit_history) > HISTORY_LENGTH:
                 self.left_fit_history.pop(0)
-        if right_fit is not None:
+
+        if right_fit is None:
+            self.right_missed += 1
+            if self.right_missed > 3:
+                self.right_fit_history.clear()
+        else:
+            self.right_missed = 0
             self.right_fit_history.append(right_fit.copy())
             if len(self.right_fit_history) > HISTORY_LENGTH:
                 self.right_fit_history.pop(0)
@@ -531,7 +595,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     # If they fail the sanity check, drop only the less reliable one
     # (judged by larger quadratic coefficient, indicating more curvature deviation).
     if left_fitx is not None and right_fitx is not None:
-        if not is_valid_lane(left_fitx, right_fitx, bev_w):
+        if not is_valid_lane(left_fitx, right_fitx, bev_w, left_fit, right_fit):
             if abs(left_fit[0]) > abs(right_fit[0]):
                 left_fit = left_fitx = None
             else:
@@ -556,11 +620,24 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         right_fit  = prev_right
         right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
 
-    # If only one lane is visible, infer the other by shifting the known one by the expected lane width
     if left_fitx is not None and right_fitx is None:
+        right_fit  = left_fit.copy()
+        right_fit[2] += target_lane_width
         right_fitx = left_fitx + target_lane_width
     elif right_fitx is not None and left_fitx is None:
-        left_fitx  = right_fitx - target_lane_width
+        left_fit  = right_fit.copy()
+        left_fit[2] -= target_lane_width
+        left_fitx = right_fitx - target_lane_width
+
+    if not left_detected and left_fit is not None:
+        state.left_fit_history.append(left_fit.copy())
+        if len(state.left_fit_history) > HISTORY_LENGTH:
+            state.left_fit_history.pop(0)
+
+    if not right_detected and right_fit is not None:
+        state.right_fit_history.append(right_fit.copy())
+        if len(state.right_fit_history) > HISTORY_LENGTH:
+            state.right_fit_history.pop(0)
 
     left_type,  left_segments  = None, []
     right_type, right_segments = None, []
@@ -676,6 +753,7 @@ def main():
     window_name = f"Result ({search_pattern})"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 600)
+    cv2.moveWindow(window_name, 0, 0)
     
     M, M_inv, roi_polygon = get_perspective_transformation()
 

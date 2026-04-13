@@ -25,7 +25,7 @@ def main():
             
             # Lancia il tuo script run_gold.py passandogli il path della camera
             # Usa python3 o python a seconda di come avvii i tuoi script di solito
-            subprocess.run(["python", "run_gold.py", camera_dir])
+            subprocess.run(["python3", "run_gold.py", camera_dir])
             
             # Quando run_gold.py termina (dopo che chiudi la sua finestra),
             # lo script si mette in pausa e aspetta un tuo comando
