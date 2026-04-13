@@ -397,17 +397,6 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
     if right_fitx is not None:
         _draw_lane(right_fitx, right_segments, right_type, bev_color, orig_img)
 
-    font  = cv2.FONT_HERSHEY_SIMPLEX
-    y_txt = 70
-
-    if left_type:
-        cv2.putText(orig_img, f"Left: {left_type}",
-                    (40, y_txt), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-        y_txt += 40
-    if right_type:
-        cv2.putText(orig_img, f"Right: {right_type}",
-                    (40, y_txt), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-
     return bev_color, orig_img
 
 
