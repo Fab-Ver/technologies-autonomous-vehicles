@@ -12,57 +12,45 @@ PRINCIPAL_POINT = np.array([970, 483])
 FOCAL_LENGTH    = np.array([1970, 1970])
 POSITION        = np.array([1.8750, 0, 1.6600])
 ROTATION        = np.array([0, 0, 0])
+HEIGHT          = POSITION[2]
 
-HEIGHT = POSITION[2]
-
-# ROI extent in meters, defining the trapezoid projected onto the road plane
+# ROI Configuration for Bird Eye View projection
 DIST_AHEAD        = 20.0
 SPACE_TO_ONE_SIDE = 2.2
 BOTTOM_OFFSET     = 6.0
+BEV_HEIGHT        = IMAGE_SIZE[1]
+BEV_WIDTH         = int(BEV_HEIGHT * (2 * SPACE_TO_ONE_SIDE) / (DIST_AHEAD - BOTTOM_OFFSET))
 
-# BEV dimensions keep the same height as the original image, width is aspect-correct
-BEV_HEIGHT = IMAGE_SIZE[1]
-BEV_WIDTH  = int(BEV_HEIGHT * (2 * SPACE_TO_ONE_SIDE) / (DIST_AHEAD - BOTTOM_OFFSET))
+# Image Filtering and Binarization
+GOLD_FILTER_D_VALUES    = [4, 6, 8, 10]
+BIN_THRESHOLD_TOLERANCE = 0.5
+MORPH_CLOSE_KERNEL      = (1, 30)
+MORPH_OPEN_KERNEL       = (3, 50)
 
-# Half-widths used by the multi-scale GOLD differential filter
-GOLD_FILTER_D_VALUES = [4, 6, 8, 10]
-
-# Sliding window search parameters
-NWINDOWS        = 9
-SW_MARGIN       = 25
-MAX_LANE_SPREAD = 40   # reject windows whose detected pixels span more than this width in px
-MINPIX          = 90
-MIN_PEAK_FRAC   = 0.09 # histogram peak must exceed this fraction of max possible value
-
-# Search band half-width when using a previously fitted polynomial
-PREV_POLY_MARGIN = 25
-
-# Number of past frames kept for temporal smoothing
-HISTORY_LENGTH = 4 
-
-# Lane type classification thresholds
-SOLID_COVERAGE_THRESHOLD = 0.55
-LANE_CHECK_MARGIN        = 15
-
-# ═══════════════════════════ Tunable Algorithm Parameters ═══════════════════════════
-TARGET_LANE_WIDTH_M       = 3.7
-LANE_PHYSICAL_WIDTH_M     = 4.6
-
-BIN_THRESHOLD_TOLERANCE   = 0.5
-MORPH_CLOSE_KERNEL        = (1, 30)
-MORPH_OPEN_KERNEL         = (3, 40)
-
+# Sliding Window Search bounds and thresholds
+NWINDOWS                       = 9
+SW_MARGIN                      = 25
+MAX_LANE_SPREAD                = 40
+MINPIX                         = 90
+MIN_PEAK_FRAC                  = 0.09
 HIST_SEARCH_MARGIN_FRAC_EDGE   = 0.05
 HIST_SEARCH_MARGIN_FRAC_CENTER = 0.15
 
-POLY_MIN_PIXELS           = 200
-POLY_MIN_HEIGHT_FRAC      = 0.2
+# Polynomial Fitting and Lane Geometry constraints
+PREV_POLY_MARGIN         = 25
+POLY_MIN_PIXELS          = 200
+POLY_MIN_HEIGHT_FRAC     = 0.2
+TARGET_LANE_WIDTH_M      = 3.7
+LANE_PHYSICAL_WIDTH_M    = 4.6
+LANE_MIN_AVG_WIDTH_FRAC  = 0.3
+LANE_MAX_AVG_WIDTH_FRAC  = 0.7
+LANE_MAX_WIDTH_DIFF_FRAC = 0.45
 
-LANE_MIN_AVG_WIDTH_FRAC   = 0.3
-LANE_MAX_AVG_WIDTH_FRAC   = 0.7
-LANE_MAX_WIDTH_DIFF_FRAC  = 0.45
-
-DASHED_MIN_DRAW_SEGMENT   = 40
+# Rendering and Temporal Smoothing
+HISTORY_LENGTH           = 4 
+SOLID_COVERAGE_THRESHOLD = 0.55
+LANE_CHECK_MARGIN        = 15
+DASHED_MIN_DRAW_SEGMENT  = 40
 
 def get_perspective_transformation():
     """Compute the IPM homography from camera parameters and ROI definition."""
@@ -70,12 +58,13 @@ def get_perspective_transformation():
     c_x, c_y = PRINCIPAL_POINT
     H = HEIGHT
 
+    # Function to project 3D ground points to 2D image pixels
     def project_to_image(X, Z):
         u = (f_x * X / Z) + c_x
         v = (f_y * H / Z) + c_y
         return [u, v]
 
-    # Project the four ROI corners from road plane to image plane
+    # Map the four trapezoid corners of the physical road to image bounds
     bl = project_to_image(-SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)
     br = project_to_image( SPACE_TO_ONE_SIDE, BOTTOM_OFFSET)
     tr = project_to_image( SPACE_TO_ONE_SIDE, DIST_AHEAD)
@@ -83,6 +72,7 @@ def get_perspective_transformation():
 
     src_pts = np.float32([bl, br, tr, tl])
 
+    # Define the rectangular top down target boundaries
     dst_pts = np.float32([
         [0, BEV_HEIGHT],
         [BEV_WIDTH, BEV_HEIGHT],
@@ -90,7 +80,7 @@ def get_perspective_transformation():
         [0, 0]
     ])
 
-    # Compute both the transformation matrix and its inverse
+    # Calculate both forward and backward matrices for drawing overlays later
     M      = cv2.getPerspectiveTransform(src_pts, dst_pts)
     M_inv  = cv2.getPerspectiveTransform(dst_pts, src_pts)
     roi_polygon = np.array(src_pts, np.int32)
@@ -137,7 +127,7 @@ def binarized_image(blurred_image):
 
     threshold = (g_max + g_min) / 2.0
 
-    # Refine the threshold until it stabilizes
+    # Iteratively refine the threshold finding the center point of the background and foreground peaks
     while True:
         region_A = blurred_image[blurred_image >= threshold]
         region_B = blurred_image[blurred_image <  threshold]
@@ -152,15 +142,15 @@ def binarized_image(blurred_image):
             break
         threshold = new_threshold
 
+    # Apply the resulting value dynamically avoiding hardcoded numbers
     binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
     binary_image[blurred_image >= threshold] = 255
 
-    # Morphological Closing (connects vertically broken line segments)
-
+    # Connect broken vertical segments using morphological closing
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_CLOSE_KERNEL)
     binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_CLOSE, kernel_close)
 
-    # Morphological Opening (removes scattered or horizontal noise)
+    # Remove small noise and horizontal blobs using morphological opening
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_OPEN_KERNEL)
     binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel_open)
 
@@ -495,18 +485,22 @@ class LaneState:
     """Keeps a rolling history of fitted polynomials to smooth detections over time."""
 
     def __init__(self):
+        # Store past valid polynomial coefficients for smoothing
         self.left_fit_history  = []
         self.right_fit_history = []
+        # Keep track of consecutive frames without a valid detection
         self.left_missed     = 0
         self.right_missed    = 0
 
     @property
     def has_history(self):
+        # Check if we have at least one past frame to use for temporal prediction
         return len(self.left_fit_history) > 0 or len(self.right_fit_history) > 0
 
     def get_averaged_fit(self):
         """Return the mean polynomial coefficients across stored history frames."""
         prev_left = prev_right = None
+        # Average the available polynomial coefficients to reduce jitter
         if self.left_fit_history:
             prev_left  = np.mean(np.array(self.left_fit_history),  axis=0)
         if self.right_fit_history:
@@ -516,22 +510,28 @@ class LaneState:
     def update(self, left_fit=None, right_fit=None):
         """Push new fits into the history, and clear it if too many consecutive frames were missed."""
         if left_fit is None:
+            # Increment the miss counter and reset history if the line was lost for too long
             self.left_missed += 1
             if self.left_missed > 3:
                 self.left_fit_history.clear()
         else:
+            # Reset the miss counter and append the new valid polynomial
             self.left_missed = 0
             self.left_fit_history.append(left_fit.copy())
+            # Maintain the rolling window size by removing the oldest frame
             if len(self.left_fit_history) > HISTORY_LENGTH:
                 self.left_fit_history.pop(0)
 
         if right_fit is None:
+            # Increment the miss counter and reset history if the line was lost for too long
             self.right_missed += 1
             if self.right_missed > 3:
                 self.right_fit_history.clear()
         else:
+            # Reset the miss counter and append the new valid polynomial
             self.right_missed = 0
             self.right_fit_history.append(right_fit.copy())
+            # Maintain the rolling window size by removing the oldest frame
             if len(self.right_fit_history) > HISTORY_LENGTH:
                 self.right_fit_history.pop(0)
 
@@ -653,10 +653,11 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
 
 def detect_obstacles(display_frame, yolo_model, roi_polygon):
     """Detect obstacles on the original image, calculate distance, and filter by ROI overlap."""
-    # Process YOLO inference for classes: 0 (person), 2 (car), 3 (motorcycle), 5 (bus), 7 (truck)
+    # Process YOLO inference for target object classes
     results = yolo_model(display_frame, classes=[0, 2, 3, 5, 7], verbose=False)
     
     h, w = display_frame.shape[:2]
+    # Create an image mask representing our drivable region of interest
     roi_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(roi_mask, [roi_polygon.reshape((-1, 1, 2))], 255)
     
@@ -669,20 +670,20 @@ def detect_obstacles(display_frame, yolo_model, roi_polygon):
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             cls = int(box.cls[0].cpu().numpy())
             
-            # Bottom-center point of the bounding box
+            # Find the bottom center coordinate of the detected bounding box
             u = (x1 + x2) / 2.0
             v = y2
             
-            # Only estimate distance if the point is below the horizon
+            # Ignore objects detected above the horizon line since we cannot map them properly
             if v <= PRINCIPAL_POINT[1]:
                 continue
                 
-            # Euclidean distance on the ground plane
+            # Estimate physical depth distance using pinhole camera equations
             z_dist = (FOCAL_LENGTH[1] * HEIGHT) / (v - PRINCIPAL_POINT[1])
             x_dist = (u - PRINCIPAL_POINT[0]) * z_dist / FOCAL_LENGTH[0]
             distance = np.sqrt(x_dist**2 + z_dist**2)
             
-            # Filter by ROI overlap
+            # Check if the obstacle bounding box overlaps with our target drivable road mask
             ix1, iy1 = int(max(0, x1)), int(max(0, y1))
             ix2, iy2 = int(min(w, x2)), int(min(h, y2))
             
@@ -693,8 +694,8 @@ def detect_obstacles(display_frame, yolo_model, roi_polygon):
             if not np.any(overlap):
                 continue
                 
-            # Draw bounding box and label
-            clr = (0, 165, 255) # Orange for obstacles
+            # Draw an orange bounding box for the valid obstacles in our lane
+            clr = (0, 165, 255)
             cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), clr, 2)
             
             label = f"{yolo_model.names[cls]} {distance:.1f}m"
