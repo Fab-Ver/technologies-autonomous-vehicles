@@ -14,7 +14,6 @@ POSITION        = np.array([1.8750, 0, 1.6600])
 ROTATION        = np.array([0, 0, 0])
 
 HEIGHT = POSITION[2]
-PITCH  = ROTATION[1]
 
 # ROI extent in meters, defining the trapezoid projected onto the road plane
 DIST_AHEAD        = 20.0
@@ -51,7 +50,7 @@ LANE_PHYSICAL_WIDTH_M     = 4.6
 
 BIN_THRESHOLD_TOLERANCE   = 0.5
 MORPH_CLOSE_KERNEL        = (1, 30)
-MORPH_OPEN_KERNEL         = (3, 50)
+MORPH_OPEN_KERNEL         = (3, 40)
 
 HIST_SEARCH_MARGIN_FRAC_EDGE   = 0.05
 HIST_SEARCH_MARGIN_FRAC_CENTER = 0.15
@@ -64,8 +63,6 @@ LANE_MAX_AVG_WIDTH_FRAC   = 0.7
 LANE_MAX_WIDTH_DIFF_FRAC  = 0.45
 
 DASHED_MIN_DRAW_SEGMENT   = 40
-
-POLY_MAX_INTERCEPT_DEVIATION = BEV_WIDTH * 0.6  # c must not place the line outside the image
 
 def get_perspective_transformation():
     """Compute the IPM homography from camera parameters and ROI definition."""
@@ -118,8 +115,10 @@ def enhance_lanes(bev_image, d_values=GOLD_FILTER_D_VALUES):
         g[g < 0] = 0
         result = np.maximum(result, g)
     
-    if result.max() > 0:
-        result = (result / result.max() * 255.0)
+    p_max = np.percentile(result, 99.9)
+    
+    if p_max > 0:
+        result = np.clip((result / p_max) * 255.0, 0, 255)
     
     result_u8 = result.astype(np.uint8)
 
@@ -357,7 +356,7 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
 
 
 
-def is_valid_lane(left_fitx, right_fitx, bev_w, left_fit=None, right_fit=None):
+def is_valid_lane(left_fitx, right_fitx, bev_w):
     """Verify that the fitted lane pair has a plausible and consistent width."""
     if left_fitx is None or right_fitx is None:
         return True
@@ -573,7 +572,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     # If they fail the sanity check, drop only the less reliable one
     # (judged by larger quadratic coefficient, indicating more curvature deviation).
     if left_fitx is not None and right_fitx is not None:
-        if not is_valid_lane(left_fitx, right_fitx, bev_w, left_fit, right_fit):
+        if not is_valid_lane(left_fitx, right_fitx, bev_w):
             if abs(left_fit[0]) > abs(right_fit[0]):
                 left_fit = left_fitx = None
             else:
@@ -668,7 +667,6 @@ def detect_obstacles(display_frame, yolo_model, roi_polygon):
             
         for box in boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = box.conf[0].cpu().numpy()
             cls = int(box.cls[0].cpu().numpy())
             
             # Bottom-center point of the bounding box
