@@ -33,7 +33,7 @@ NWINDOWS        = 9
 SW_MARGIN       = 25
 MAX_LANE_SPREAD = 40   # reject windows whose detected pixels span more than this width in px
 MINPIX          = 90
-MIN_PEAK_FRAC   = 0.06 # histogram peak must exceed this fraction of max possible value
+MIN_PEAK_FRAC   = 0.09 # histogram peak must exceed this fraction of max possible value
 
 # Search band half-width when using a previously fitted polynomial
 PREV_POLY_MARGIN = 25
@@ -57,21 +57,15 @@ HIST_SEARCH_MARGIN_FRAC_EDGE   = 0.05
 HIST_SEARCH_MARGIN_FRAC_CENTER = 0.15
 
 POLY_MIN_PIXELS           = 200
-POLY_MIN_HEIGHT_FRAC      = 0.3
-POLY_MAX_CURVATURE        = 0.003
+POLY_MIN_HEIGHT_FRAC      = 0.2
 
-LANE_MIN_WIDTH_FRAC       = 0.25
 LANE_MIN_AVG_WIDTH_FRAC   = 0.3
 LANE_MAX_AVG_WIDTH_FRAC   = 0.7
 LANE_MAX_WIDTH_DIFF_FRAC  = 0.45
 
 DASHED_MIN_DRAW_SEGMENT   = 40
 
-POLY_MAX_SLOPE = 0.8        # maximum acceptable linear coefficient b (slope)
 POLY_MAX_INTERCEPT_DEVIATION = BEV_WIDTH * 0.6  # c must not place the line outside the image
-
-LANE_MAX_A_DIFF = 0.001   
-LANE_MAX_B_DIFF = 0.4 
 
 def get_perspective_transformation():
     """Compute the IPM homography from camera parameters and ROI definition."""
@@ -335,10 +329,8 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
                 # Evaluate where the curve sits at the bottom of the image (highest y value)
                 bottom_x = a * (h - 1)**2 + b * (h - 1) + c
 
-                # Accept the fit only if curvature, slope, and bottom position are all plausible
-                if (abs(a) <= POLY_MAX_CURVATURE
-                        and abs(b) <= POLY_MAX_SLOPE
-                        and 0 <= bottom_x <= BEV_WIDTH):
+                # Accept the fit only if bottom position is plausible
+                if 0 <= bottom_x <= BEV_WIDTH:
                     left_fit  = fit
                     left_fitx = a * ploty**2 + b * ploty + c
 
@@ -351,12 +343,10 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
                 fit = np.polyfit(righty, rightx, 2)
                 a, b, c = fit
 
-                # Same geometric validation applied symmetrically to the right lane
+                # Evaluate where the curve sits at the bottom of the image (highest y value)
                 bottom_x = a * (h - 1)**2 + b * (h - 1) + c
 
-                if (abs(a) <= POLY_MAX_CURVATURE
-                        and abs(b) <= POLY_MAX_SLOPE
-                        and 0 <= bottom_x <= BEV_WIDTH):
+                if 0 <= bottom_x <= BEV_WIDTH:
                     right_fit  = fit
                     right_fitx = a * ploty**2 + b * ploty + c
 
@@ -374,9 +364,7 @@ def is_valid_lane(left_fitx, right_fitx, bev_w, left_fit=None, right_fit=None):
 
     widths = right_fitx - left_fitx
 
-    if np.any(widths < bev_w * LANE_MIN_WIDTH_FRAC):
-        return False
-
+    # Ensure the average lane width remains within expected physical proportions
     avg_width = np.mean(widths)
     if not (LANE_MIN_AVG_WIDTH_FRAC * bev_w <= avg_width <= LANE_MAX_AVG_WIDTH_FRAC * bev_w):
         return False
@@ -391,16 +379,9 @@ def is_valid_lane(left_fitx, right_fitx, bev_w, left_fit=None, right_fit=None):
     if diff > LANE_MAX_WIDTH_DIFF_FRAC * target_lane_width:
         return False
     
-    if left_fit is not None and right_fit is not None:
-        if abs(left_fit[0] - right_fit[0]) > LANE_MAX_A_DIFF:
-            return False
-        if abs(left_fit[1] - right_fit[1]) > LANE_MAX_B_DIFF:
-            return False
-
     return True
 
 
-# ═══════════════════════════ Step 7: Lane Type Classification ═══════════════════════════
 
 def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     """Classify a lane as solid or dashed by measuring how continuously pixels appear along its curve."""
@@ -437,7 +418,6 @@ def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     return lane_type, segments, coverage
 
 
-# ═══════════════════════════ Step 10: Drawing ═══════════════════════════
 
 def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
                       left_fitx, right_fitx, M_inv,
@@ -492,7 +472,6 @@ def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
     return bev_color, orig_img
 
 
-# ═══════════════════════════ Histogram Visualization ═══════════════════════════
 
 def draw_histogram(histogram, width, height):
     """Render a column histogram as an image for the debug panel."""
@@ -512,7 +491,6 @@ def draw_histogram(histogram, width, height):
     return hist_img
 
 
-# ═══════════════════════════ Lane State (Frame Memory) ═══════════════════════════
 
 class LaneState:
     """Keeps a rolling history of fitted polynomials to smooth detections over time."""
@@ -559,7 +537,7 @@ class LaneState:
                 self.right_fit_history.pop(0)
 
 
-# ═══════════════════════════ Pipeline ═══════════════════════════
+
 
 def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     """Run the full lane detection pipeline on a single frame and return annotated outputs."""
@@ -672,7 +650,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     return display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty
 
 
-# ═══════════════════════════ Step 11: Obstacle Detection ═══════════════════════════
+
 
 def detect_obstacles(display_frame, yolo_model, roi_polygon):
     """Detect obstacles on the original image, calculate distance, and filter by ROI overlap."""
@@ -850,7 +828,7 @@ def main():
     print("Playback finished. Press any key to close the window.")
     try:
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) != -1.0:
-            cv2.waitKey(0)
+            cv2.waitKey(1000)
     except:
         pass
     cv2.destroyAllWindows()
