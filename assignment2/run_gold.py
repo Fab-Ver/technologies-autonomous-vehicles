@@ -317,9 +317,10 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
 
                 # Evaluate where the curve sits at the bottom of the image (highest y value)
                 bottom_x = a * (h - 1)**2 + b * (h - 1) + c
+                top_x    = c
 
                 # Accept the fit only if bottom position is plausible
-                if 0 <= bottom_x <= BEV_WIDTH:
+                if 0 <= bottom_x <= BEV_WIDTH and 0 <= top_x <= BEV_WIDTH:
                     left_fit  = fit
                     left_fitx = a * ploty**2 + b * ploty + c
 
@@ -334,8 +335,9 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
 
                 # Evaluate where the curve sits at the bottom of the image (highest y value)
                 bottom_x = a * (h - 1)**2 + b * (h - 1) + c
+                top_x    = c
 
-                if 0 <= bottom_x <= BEV_WIDTH:
+                if 0 <= bottom_x <= BEV_WIDTH and 0 <= top_x <= BEV_WIDTH:
                     right_fit  = fit
                     right_fitx = a * ploty**2 + b * ploty + c
 
@@ -374,20 +376,21 @@ def is_valid_lane(left_fitx, right_fitx, bev_w):
 
 def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     """Classify a lane as solid or dashed by measuring how continuously pixels appear along its curve."""
-    h, w     = binary_warped.shape
-    presence = np.zeros(len(ploty), dtype=bool)
-
-    # Check each row: if any white pixel lies within the margin band around the curve, mark it present
-    for i in range(len(ploty)):
-        xi = int(round(fitx[i]))
-        yi = int(round(ploty[i]))
-        if 0 <= yi < h:
-            x_lo = max(0, xi - margin)
-            x_hi = min(w, xi + margin)
-            if x_lo < x_hi and np.any(binary_warped[yi, x_lo:x_hi] > 0):
-                presence[i] = True
-
-    coverage  = np.sum(presence) / len(presence) if len(presence) > 0 else 0
+    h, w = binary_warped.shape
+    
+    # Create a blank mask and draw the fitted polynomial as a thick line
+    lane_mask = np.zeros((h, w), dtype=np.uint8)
+    pts = np.column_stack([fitx, ploty]).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(lane_mask, [pts], isClosed=False, color=255, thickness=margin*2)
+    
+    # Find where the drawn lane overlaps with actual detected pixels
+    overlap = cv2.bitwise_and(binary_warped, lane_mask)
+    
+    # Calculate coverage based on row presence
+    # Summing across rows: if > 0, the row has at least one pixel
+    presence = np.any(overlap > 0, axis=1)
+    
+    coverage = np.sum(presence) / len(presence) if len(presence) > 0 else 0
     lane_type = "solid" if coverage > SOLID_COVERAGE_THRESHOLD else "dashed"
 
     # Group consecutive present rows into drawable segments for dashed line rendering
@@ -584,7 +587,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     right_detected = right_fit is not None
 
     # Update history only with genuinely detected fits, not with fallback estimates
-    state.update(left_fit, right_fit)
+    state.update(left_fit if left_detected else None, right_fit if right_detected else None)
 
     # If a side was not detected this frame, fall back to the historical average
     prev_left, prev_right = state.get_averaged_fit()
@@ -651,16 +654,12 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
 
 
 
-def detect_obstacles(display_frame, yolo_model, roi_polygon):
+def detect_obstacles(display_frame, yolo_model, roi_mask):
     """Detect obstacles on the original image, calculate distance, and filter by ROI overlap."""
     # Process YOLO inference for target object classes
     results = yolo_model(display_frame, classes=[0, 2, 3, 5, 7], verbose=False)
     
     h, w = display_frame.shape[:2]
-    # Create an image mask representing our drivable region of interest
-    roi_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(roi_mask, [roi_polygon.reshape((-1, 1, 2))], 255)
-    
     for r in results:
         boxes = r.boxes
         if boxes is None:
@@ -732,13 +731,19 @@ def main():
     cv2.resizeWindow(window_name, 1600, 600)
     cv2.moveWindow(window_name, 0, 0)
     
-    M, M_inv, roi_polygon = get_perspective_transformation()
+    M, M_inv, roi_polygon = get_perspective_transformation() 
 
     state = LaneState()
 
     # Load YOLO model
     print("Loading YOLOv8 nano model...")
     yolo_model = YOLO("yolov8n.pt")
+
+
+    # Create an image mask representing our drivable region of interest
+    h, w = IMAGE_SIZE[1], IMAGE_SIZE[0]
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [roi_polygon.reshape((-1, 1, 2))], 255)
 
     for img_path in image_paths:
         frame = cv2.imread(img_path)
@@ -751,7 +756,7 @@ def main():
         )
 
         display_frame = detect_obstacles(
-            display_frame, yolo_model, roi_polygon
+            display_frame, yolo_model, roi_mask
         )
 
         cv2.polylines(display_frame, [roi_polygon.reshape((-1, 1, 2))], True, (0, 0, 255), 3)
@@ -816,7 +821,7 @@ def main():
 
         cv2.imshow(window_name, resized)
 
-        key = cv2.waitKey(200) & 0xFF
+        key = cv2.waitKey(100) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
