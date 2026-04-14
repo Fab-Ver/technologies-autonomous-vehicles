@@ -566,7 +566,9 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
             if len(righty) == 0:
                 rightx, righty = hx_r, hy_r
 
-    left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(binary, leftx, lefty, rightx, righty)
+    left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(
+        binary, leftx, lefty, rightx, righty
+    )
 
     target_lane_width = bev_w * (TARGET_LANE_WIDTH_M / LANE_PHYSICAL_WIDTH_M)
     draw_polygon      = False
@@ -586,12 +588,16 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     left_detected  = left_fit  is not None
     right_detected = right_fit is not None
 
-    # Update history only with genuinely detected fits, not with fallback estimates
-    state.update(left_fit if left_detected else None, right_fit if right_detected else None)
+    state.update(
+        left_fit  if left_detected else None,
+        right_fit if right_detected else None,
+    )
 
-    # If a side was not detected this frame, fall back to the historical average
+    # Read the historical average AFTER the update so we get a clean,
+    # current-frame-aware fallback (but without polluting it yet with estimates).
     prev_left, prev_right = state.get_averaged_fit()
 
+    # If a side was not detected this frame, fall back to the historical average
     if left_fitx is None and prev_left is not None:
         left_fit  = prev_left
         left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
@@ -600,24 +606,17 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         right_fit  = prev_right
         right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
 
+    # If only one lane is available, synthesise the other by a fixed pixel offset.
+    # Note: this is geometrically approximate on curves (a parallel curve has a
+    # slightly different quadratic coefficient) but is acceptable for gentle bends.
     if left_fitx is not None and right_fitx is None:
-        right_fit  = left_fit.copy()
+        right_fit    = left_fit.copy()
         right_fit[2] += target_lane_width
-        right_fitx = left_fitx + target_lane_width
+        right_fitx   = left_fitx + target_lane_width
     elif right_fitx is not None and left_fitx is None:
-        left_fit  = right_fit.copy()
+        left_fit    = right_fit.copy()
         left_fit[2] -= target_lane_width
-        left_fitx = right_fitx - target_lane_width
-
-    if not left_detected and left_fit is not None:
-        state.left_fit_history.append(left_fit.copy())
-        if len(state.left_fit_history) > HISTORY_LENGTH:
-            state.left_fit_history.pop(0)
-
-    if not right_detected and right_fit is not None:
-        state.right_fit_history.append(right_fit.copy())
-        if len(state.right_fit_history) > HISTORY_LENGTH:
-            state.right_fit_history.pop(0)
+        left_fitx   = right_fitx - target_lane_width
 
     left_type,  left_segments  = None, []
     right_type, right_segments = None, []
@@ -631,7 +630,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         left_fitx, right_fitx, M_inv,
         left_type, right_type,
         left_segments, right_segments,
-        draw_polygon=draw_polygon
+        draw_polygon=draw_polygon,
     )
 
     # Overlay a warning on the BEV when fewer than two lanes were reliably found
