@@ -361,13 +361,9 @@ def is_valid_lane(left_fitx, right_fitx, bev_w):
         return False
 
     # The lane width should not vary too much between the top and bottom of the image
-    width_top    = widths[0]
-    width_bottom = widths[-1]
-
     target_lane_width = bev_w * (TARGET_LANE_WIDTH_M / LANE_PHYSICAL_WIDTH_M)
-    diff = abs(width_top - width_bottom)
-
-    if diff > LANE_MAX_WIDTH_DIFF_FRAC * target_lane_width:
+    width_std = np.std(widths)
+    if width_std > LANE_MAX_WIDTH_DIFF_FRAC * target_lane_width:
         return False
     
     return True
@@ -486,59 +482,55 @@ def draw_histogram(histogram, width, height):
 
 class LaneState:
     """Keeps a rolling history of fitted polynomials to smooth detections over time."""
-
     def __init__(self):
-        # Store past valid polynomial coefficients for smoothing
         self.left_fit_history  = []
         self.right_fit_history = []
-        # Keep track of consecutive frames without a valid detection
-        self.left_missed     = 0
-        self.right_missed    = 0
+        self.left_missed       = 0
+        self.right_missed      = 0
 
     @property
-    def has_history(self):
-        # Check if we have at least one past frame to use for temporal prediction
-        return len(self.left_fit_history) > 0 or len(self.right_fit_history) > 0
+    def has_left_history(self):
+        return len(self.left_fit_history) > 0
+
+    @property
+    def has_right_history(self):
+        return len(self.right_fit_history) > 0
+
+    def _weighted_average(self, history):
+        n       = len(history)
+        weights = np.array([2**i for i in range(n)], dtype=np.float64)
+        weights /= weights.sum()
+        return np.average(np.array(history), axis=0, weights=weights)
 
     def get_averaged_fit(self):
-        """Return the mean polynomial coefficients across stored history frames."""
-        prev_left = prev_right = None
-        # Average the available polynomial coefficients to reduce jitter
-        if self.left_fit_history:
-            prev_left  = np.mean(np.array(self.left_fit_history),  axis=0)
-        if self.right_fit_history:
-            prev_right = np.mean(np.array(self.right_fit_history), axis=0)
+        """Return exponentially weighted polynomial coefficients for each side."""
+        prev_left  = self._weighted_average(self.left_fit_history)  if self.has_left_history  else None
+        prev_right = self._weighted_average(self.right_fit_history) if self.has_right_history else None
         return prev_left, prev_right
 
+    def _push(self, history, fit):
+        """Append a fit to a history buffer and enforce the rolling window size."""
+        history.append(fit.copy())
+        if len(history) > HISTORY_LENGTH:
+            history.pop(0)
+
     def update(self, left_fit=None, right_fit=None):
-        """Push new fits into the history, and clear it if too many consecutive frames were missed."""
+        """Push new fits into history. Pass None for any side not detected this frame."""
         if left_fit is None:
-            # Increment the miss counter and reset history if the line was lost for too long
             self.left_missed += 1
             if self.left_missed > 3:
                 self.left_fit_history.clear()
         else:
-            # Reset the miss counter and append the new valid polynomial
             self.left_missed = 0
-            self.left_fit_history.append(left_fit.copy())
-            # Maintain the rolling window size by removing the oldest frame
-            if len(self.left_fit_history) > HISTORY_LENGTH:
-                self.left_fit_history.pop(0)
+            self._push(self.left_fit_history, left_fit)
 
         if right_fit is None:
-            # Increment the miss counter and reset history if the line was lost for too long
             self.right_missed += 1
             if self.right_missed > 3:
                 self.right_fit_history.clear()
         else:
-            # Reset the miss counter and append the new valid polynomial
             self.right_missed = 0
-            self.right_fit_history.append(right_fit.copy())
-            # Maintain the rolling window size by removing the oldest frame
-            if len(self.right_fit_history) > HISTORY_LENGTH:
-                self.right_fit_history.pop(0)
-
-
+            self._push(self.right_fit_history, right_fit)
 
 
 def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
@@ -552,19 +544,28 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     enhanced = enhance_lanes(bev)
     binary   = binarized_image(enhanced)
 
-    # Use the faster previous-polynomial search when history is available,
-    # falling back to the histogram approach for any side that returns no pixels
-    if not state.has_history:
-        leftx, lefty, rightx, righty = find_lane_pixels_histogram(binary)
+    prev_left, prev_right = state.get_averaged_fit()
+    _hist_result = None 
+
+    def _histogram():
+        nonlocal _hist_result
+        if _hist_result is None:
+            _hist_result = find_lane_pixels_histogram(binary)
+        return _hist_result
+
+    if state.has_left_history:
+        leftx, lefty, _, _ = find_lane_pixels_prev_poly(binary, prev_left, None)
+        if len(lefty) == 0:
+            leftx, lefty, _, _ = _histogram()
     else:
-        prev_left, prev_right = state.get_averaged_fit()
-        leftx, lefty, rightx, righty = find_lane_pixels_prev_poly(binary, prev_left, prev_right)
-        if len(lefty) == 0 or len(righty) == 0:
-            hx_l, hy_l, hx_r, hy_r = find_lane_pixels_histogram(binary)
-            if len(lefty)  == 0:
-                leftx,  lefty  = hx_l, hy_l
-            if len(righty) == 0:
-                rightx, righty = hx_r, hy_r
+        leftx, lefty, _, _ = _histogram()
+
+    if state.has_right_history:
+        _, _, rightx, righty = find_lane_pixels_prev_poly(binary, None, prev_right)
+        if len(righty) == 0:
+            _, _, rightx, righty = _histogram()
+    else:
+        _, _, rightx, righty = _histogram()
 
     left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(
         binary, leftx, lefty, rightx, righty
@@ -649,8 +650,6 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     binary_color = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
     return display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty
-
-
 
 
 def detect_obstacles(display_frame, yolo_model, roi_mask):
