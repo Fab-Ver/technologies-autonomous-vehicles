@@ -1,0 +1,114 @@
+\documentclass[12pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage{textcomp}
+\usepackage{titlesec}
+\usepackage{subcaption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+% --- Metadata Macros (edit these) ---
+\newcommand{\university}{Politecnico di Torino}
+\newcommand{\department}{Department of Control and Computer Engineering}
+\newcommand{\degree}{Master's Degree in Computer Engineering}
+\newcommand{\academicyear}{2025/2026}
+\newcommand{\course}{Technologies for Autonomous Vehicles}
+\newcommand{\reporttitle}{Assignment 2: Lane Detection} % e.g., "Report 1"
+\newcommand{\reportdate}{21/04/2026}    % or "Date, \_\_\_"
+
+% Helper to list students as "Name Surname -- S123456"
+\newcommand{\student}[2]{#1 -- #2\\}
+
+% --- Title Page ---
+\begin{document}
+\begin{titlepage}
+  \centering
+  \vspace*{1cm}
+  \includegraphics[width=0.35\textwidth]{img/logo_poli.png}\par
+  \vspace{1cm}
+  {\LARGE \textbf{\university}\par}
+  \vspace{0.3cm}
+  {\large \department\par}
+  \vspace{0.3cm}
+  {\Large \degree\par}
+  \vspace{0.6cm}
+  {\Large \academicyear\par}
+  \vspace{0.8cm}
+  {\LARGE \textbf{\course}\par}
+  \vspace{0.8cm}
+  {\LARGE \textbf{\reporttitle}\par}
+  \vfill
+  {\large \reportdate \par}
+  \vspace{0.2cm}
+  {\large
+  % --- EDIT THE NAMES BELOW ---
+  \student{Fabio Veroli}{S336301}
+  }
+  \vspace*{0.5cm}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% --- Body ---
+
+\section{Objectives}
+The primary goal of this project is to develop and implement a robust lane detection pipeline in Python. The algorithm processes real images from the PandaSet dataset, specifically from the front camera. The system is designed to detect lane delimiters and display them on the images, providing a message when no lanes are found.
+
+The project addresses the following mandatory and optional requirements:
+\begin{itemize}
+    \item \textbf{Mandatory Requirement:} Process a sequence of images to detect lane delimiters. Display the detected lanes as green lines over a bird's eye view, or print "No lanes found" if detection fails.
+    \item \textbf{Optional Requirement 1:} Discriminate between continuous and dashed lane lines.
+    \item \textbf{Optional Requirement 2:} Display the detected lane delimiters directly on the original front-facing image.
+    \item \textbf{Optional Requirement 3:} Detect obstacles present in the lane and estimate their approximate distance from the vehicle.
+\end{itemize}
+
+\section{Design}
+
+\subsection{Mandatory Requirements Implementation}
+The pipeline consists of the following logical phases:
+
+\begin{enumerate}
+    \item \textbf{Inverse Perspective Mapping (IPM) and Region of Interest (ROI):} To process road markings with a constant width regardless of their distance, the perspective effect is removed. Using the provided camera parameters, a geometric transformation matrix is computed. Instead of mapping the entire camera frame, a specific physical Region of Interest (ROI) is defined ahead of the vehicle, constrained by parameters such as \texttt{DIST\_AHEAD} and \texttt{SPACE\_TO\_ONE\_SIDE}. By extracting only this relevant trapezoidal area of the road, the computational load is significantly reduced. This ROI is then warped into a rectangular, top-down bird's eye view.
+    \item \textbf{Pre-processing and Filtering:} The bird's eye view image is converted to grayscale and blurred. Inspired by the approach described in the GOLD (Generic Obstacle and Lane Detection) algorithm, a multi-scale differential edge filter is applied over a specific set of distances. This filter isolates and enhances pixels that are brighter than their horizontal neighbors, effectively highlighting painted lane markings on the darker road surface.
+    \item \textbf{Binarization:} The enhanced image is converted into a binary mask. Rather than applying a fixed threshold, an iterative thresholding algorithm finds a dynamic value that optimally separates the foreground (lane markings) from the background. Morphological closing and opening operations are subsequently applied using specific kernel sizes to bridge broken segments and remove isolated noise elements, respectively.
+    \item \textbf{Feature Extraction and Lane Tracking:} Throughout the pipeline, the left and right lane boundaries are treated as two almost completely independent entities. This critical phase handles their robust detection over time using distinct strategies based on the current execution context:
+    \begin{itemize}
+        \item \textbf{Cold Start Search (Histogram and Sliding Windows):} When no prior lane information is available, the algorithm computes a column histogram of the lower half of the binary image to identify starting x-coordinates for the left and right lines based on pixel intensity peaks. The image edges and center are masked out to avoid interference from the vehicle hood or off-road artifacts. A sliding window technique then independently tracks the left and right lane pixels upwards. The window horizontally re-centers as it moves if a minimum number of white pixels (\texttt{MINPIX}) are found within its margin.
+        \item \textbf{Temporal Tracking:} To optimize performance across consecutive frames, if a lane was successfully detected previously, the sliding window mechanism is bypassed. Instead, the algorithm searches for new lane pixels strictly within a fixed margin (\texttt{PREV\_POLY\_MARGIN}) around the mathematical curves established in the previous frame.
+        \item \textbf{Polynomial Fitting and Missing Lines:} Once sufficient pixels are gathered, a second-degree polynomial is fitted to each line independently. The detected curves must pass strict geometric constraints, such as having enough defining pixels spanning a minimum vertical length. A final validation checks that the calculated distance between the two detected lane lines (if both are present) corresponds consistently to expected real-world dimensions. Since the two lines are evaluated as separate entities, the system can gracefully handle partial scenes: if only one valid line is detected (e.g., due to occlusion or missing paint), it successfully tracks the visible side while leaving the other blank. If neither line satisfies the requirements, the algorithm falls back safely, displaying a ``No lanes found'' message on the output frame rather than drawing arbitrary curves.
+        \item \textbf{Temporal Smoothing:} To stabilize the visible overlays and bridge momentary gaps in detection—caused by missing paint or glare—a state tracker (\texttt{LaneState}) caches recent valid detections. Averaging the polynomial coefficients over a short history of frames provides a low-pass filtering effect.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Optional Requirement 1: Continuous vs. Dashed Lanes}
+To classify the type of lane delimiter, the pipeline analyzes the vertical distribution of pixels along the fitted polynomial. It extracts the binary pixel intensities aligned with the curve's path. By computing the ratio of white pixels (solid paint) to the total length of the line segment, the system determines the coverage proportion. If this coverage exceeds a defined constant (\texttt{SOLID\_COVERAGE\_THRESHOLD}), the line is classified as continuous; otherwise, it is registered as dashed. 
+
+Once classified, this distinction is directly reflected in the final visualization. Solid lines are rendered as a single, unbroken polygon stretching along the detected curve. For dashed lines, the rendering algorithm highlights only the individual segments where the paint was actually detected, leaving transparent gaps in between.
+
+\subsection{Optional Requirement 2: Original Image Visualization}
+While the analytical processing occurs in the bird's eye view, presenting the result on the original perspective image provides better spatial context. This is achieved by using the inverse transformation matrix (\texttt{M\_inv}) calculated during the initial IPM phase. The mathematical points generating the fitted polynomials in the top-down view are projected back into original camera coordinates and drawn directly onto the user-facing frame.
+
+\subsection{Optional Requirement 3: Obstacle Detection}
+The system integrates a pre-trained YOLO object detection model to identify common vehicle classes. While the neural network processes the entire perspective frame to detect all present vehicles, plotting every single bounding box would heavily clutter the visualization. Therefore, for visual clarity, the algorithm filters the results and renders only the obstacles whose bounding boxes overlap with the defined drivable Region of Interest (ROI) mask. For these relevant vehicles, the approximate physical distance in meters is computationally estimated directly from the original image using pinhole camera equations applied to the bounding box's lowest point (the contact point with the road).
+
+\section{Experiments}
+
+\section{Results and Discussion}
+
+
+\end{document}
