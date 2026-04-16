@@ -41,7 +41,7 @@ PREV_POLY_MARGIN         = 25
 POLY_MIN_PIXELS          = 200
 POLY_MIN_HEIGHT_FRAC     = 0.2
 TARGET_LANE_WIDTH_M      = 3.7
-LANE_PHYSICAL_WIDTH_M    = 4.6
+LANE_PHYSICAL_WIDTH_M    = 2 * SPACE_TO_ONE_SIDE
 LANE_MIN_AVG_WIDTH_FRAC  = 0.3
 LANE_MAX_AVG_WIDTH_FRAC  = 0.7
 LANE_MAX_WIDTH_DIFF_FRAC = 0.45
@@ -297,10 +297,9 @@ def find_lane_pixels_prev_poly(binary_warped, prev_left_fit, prev_right_fit):
 def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
     """Fit a second-degree polynomial (x = ay^2 + by + c) to each set of lane pixels.
     
-    Validates each fit against three geometric constraints:
-      - curvature  (a): must not exceed POLY_MAX_CURVATURE
-      - slope      (b): must not exceed POLY_MAX_SLOPE
-      - position   (c): the curve's bottom-most x must lie within the BEV image width
+    Validates each fit against basic position constraints, ensuring the curve
+    is generated from an adequate spread of contiguous pixels and its bottom-most
+    $x$ coordinate lies within valid image bounds.
     """
     h     = binary_warped.shape[0]
     ploty = np.linspace(0, h - 1, h)
@@ -403,7 +402,7 @@ def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     if start is not None:
         segments.append((start, len(presence) - 1))
 
-    return lane_type, segments, coverage
+    return lane_type, segments
 
 
 
@@ -622,9 +621,9 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     left_type,  left_segments  = None, []
     right_type, right_segments = None, []
     if left_fitx  is not None:
-        left_type,  left_segments,  _ = classify_lane_type(binary, left_fitx,  ploty)
+        left_type,  left_segments  = classify_lane_type(binary, left_fitx,  ploty)
     if right_fitx is not None:
-        right_type, right_segments, _ = classify_lane_type(binary, right_fitx, ploty)
+        right_type, right_segments = classify_lane_type(binary, right_fitx, ploty)
 
     bev_with_lanes, display_frame = draw_lane_overlay(
         display_frame, bev.copy(), binary, ploty,
@@ -675,12 +674,10 @@ def detect_obstacles(display_frame, yolo_model, roi_mask):
             if v <= PRINCIPAL_POINT[1]:
                 continue
                 
-            # Estimate physical depth distance using pinhole camera equations
+            # Estimate longitudinal depth (z_dist) using flat-road pinhole geometry
             z_dist = (FOCAL_LENGTH[1] * HEIGHT) / (v - PRINCIPAL_POINT[1])
-            x_dist = (u - PRINCIPAL_POINT[0]) * z_dist / FOCAL_LENGTH[0]
-            distance = np.sqrt(x_dist**2 + z_dist**2)
             
-            # Check if the obstacle bounding box overlaps with our target drivable road mask
+            # Check ROI overlap to filter out off-road objects
             ix1, iy1 = int(max(0, x1)), int(max(0, y1))
             ix2, iy2 = int(min(w, x2)), int(min(h, y2))
             
@@ -691,11 +688,10 @@ def detect_obstacles(display_frame, yolo_model, roi_mask):
             if not np.any(overlap):
                 continue
                 
-            # Draw an orange bounding box for the valid obstacles in our lane
             clr = (0, 165, 255)
             cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), clr, 2)
             
-            label = f"{yolo_model.names[cls]} {distance:.1f}m"
+            label = f"{yolo_model.names[cls]} {z_dist:.1f}m"
             font = cv2.FONT_HERSHEY_SIMPLEX
             ts = cv2.getTextSize(label, font, 0.6, 2)[0]
             
