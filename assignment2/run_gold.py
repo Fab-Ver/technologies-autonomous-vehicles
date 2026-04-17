@@ -80,7 +80,7 @@ def get_perspective_transformation():
         [0, 0]
     ])
 
-    # Calculate both forward and backward matrices for drawing overlays later
+    # Calculate both forward and backward matrices 
     M      = cv2.getPerspectiveTransform(src_pts, dst_pts)
     M_inv  = cv2.getPerspectiveTransform(dst_pts, src_pts)
     roi_polygon = np.array(src_pts, np.int32)
@@ -105,6 +105,7 @@ def enhance_lanes(bev_image, d_values=GOLD_FILTER_D_VALUES):
         g[g < 0] = 0
         result = np.maximum(result, g)
     
+    # Normalize the result to the 0-255 range based on a high percentile to avoid outliers dominating the scaling
     p_max = np.percentile(result, 99.9)
     
     if p_max > 0:
@@ -112,25 +113,26 @@ def enhance_lanes(bev_image, d_values=GOLD_FILTER_D_VALUES):
     
     result_u8 = result.astype(np.uint8)
 
+    # Remove small horizontal noise and thin horizontal lines using morphological opening with a vertical kernel
     kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1,15))
     result_u8   = cv2.morphologyEx(result_u8, cv2.MORPH_OPEN, kernel_vert)
 
     return result_u8
 
-def binarized_image(blurred_image):
+def binarized_image(enhanced_image):
     """Binarize the enhanced image using an iterative threshold that converges on the mean of the two region means."""
-    g_min = float(np.min(blurred_image))
-    g_max = float(np.max(blurred_image))
+    g_min = float(np.min(enhanced_image))
+    g_max = float(np.max(enhanced_image))
 
     if g_max == g_min:
-        return np.zeros_like(blurred_image, dtype=np.uint8)
+        return np.zeros_like(enhanced_image, dtype=np.uint8)
 
     threshold = (g_max + g_min) / 2.0
 
     # Iteratively refine the threshold finding the center point of the background and foreground peaks
     while True:
-        region_A = blurred_image[blurred_image >= threshold]
-        region_B = blurred_image[blurred_image <  threshold]
+        region_A = enhanced_image[enhanced_image >= threshold]
+        region_B = enhanced_image[enhanced_image <  threshold]
 
         g_A = np.mean(region_A) if len(region_A) > 0 else 0
         g_B = np.mean(region_B) if len(region_B) > 0 else 0
@@ -143,8 +145,8 @@ def binarized_image(blurred_image):
         threshold = new_threshold
 
     # Apply the resulting value dynamically avoiding hardcoded numbers
-    binary_image = np.zeros_like(blurred_image, dtype=np.uint8)
-    binary_image[blurred_image >= threshold] = 255
+    binary_image = np.zeros_like(enhanced_image, dtype=np.uint8)
+    binary_image[enhanced_image >= threshold] = 255
 
     # Connect broken vertical segments using morphological closing
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_CLOSE_KERNEL)
@@ -188,7 +190,6 @@ def find_lane_pixels_histogram(binary_warped):
         return np.array([]), np.array([]), np.array([]), np.array([])
 
     # Find the x-coordinates of the starting points (bases) for the left and right lines.
-    # If the peak is too weak, default to the extreme image edges.
     leftx_base  = int(np.argmax(left_half))             if has_left  else None
     rightx_base = int(np.argmax(right_half)) + midpoint if has_right else None
 
@@ -299,7 +300,7 @@ def fit_polynomial(binary_warped, leftx, lefty, rightx, righty):
     
     Validates each fit against basic position constraints, ensuring the curve
     is generated from an adequate spread of contiguous pixels and its bottom-most
-    $x$ coordinate lies within valid image bounds.
+    x coordinate lies within valid image bounds.
     """
     h     = binary_warped.shape[0]
     ploty = np.linspace(0, h - 1, h)
@@ -368,7 +369,6 @@ def is_valid_lane(left_fitx, right_fitx, bev_w):
     return True
 
 
-
 def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
     """Classify a lane as solid or dashed by measuring how continuously pixels appear along its curve."""
     h, w = binary_warped.shape
@@ -403,7 +403,6 @@ def classify_lane_type(binary_warped, fitx, ploty, margin=LANE_CHECK_MARGIN):
         segments.append((start, len(presence) - 1))
 
     return lane_type, segments
-
 
 
 def draw_lane_overlay(orig_img, bev_color, binary_warped, ploty,
@@ -477,8 +476,6 @@ def draw_histogram(histogram, width, height):
 
     return hist_img
 
-
-
 class LaneState:
     """Keeps a rolling history of fitted polynomials to smooth detections over time."""
     def __init__(self):
@@ -546,6 +543,8 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     prev_left, prev_right = state.get_averaged_fit()
     _hist_result = None 
 
+    # Define a helper function to compute the histogram-based lane pixel detection only once per frame, 
+    # and cache the result for reuse if both sides need it
     def _histogram():
         nonlocal _hist_result
         if _hist_result is None:
@@ -566,6 +565,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     else:
         _, _, rightx, righty = _histogram()
 
+    # Fit polynomials to the detected lane pixels and validate the fits against geometric constraints
     left_fit, right_fit, left_fitx, right_fitx, ploty = fit_polynomial(
         binary, leftx, lefty, rightx, righty
     )
@@ -593,8 +593,8 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         right_fit if right_detected else None,
     )
 
-    # Read the historical average AFTER the update so we get a clean,
-    # current-frame-aware fallback (but without polluting it yet with estimates).
+    # Read the historical average after the update so we get a clean,
+    # current-frame-aware fallback.
     prev_left, prev_right = state.get_averaged_fit()
 
     # If a side was not detected this frame, fall back to the historical average
@@ -607,8 +607,6 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
 
     # If only one lane is available, synthesise the other by a fixed pixel offset.
-    # Note: this is geometrically approximate on curves (a parallel curve has a
-    # slightly different quadratic coefficient) but is acceptable for gentle bends.
     if left_fitx is not None and right_fitx is None:
         right_fit    = left_fit.copy()
         right_fit[2] += target_lane_width
@@ -618,6 +616,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
         left_fit[2] -= target_lane_width
         left_fitx   = right_fitx - target_lane_width
 
+    # Classify each lane as solid or dashed based on pixel coverage
     left_type,  left_segments  = None, []
     right_type, right_segments = None, []
     if left_fitx  is not None:
@@ -648,7 +647,7 @@ def lane_finding_pipeline(frame, M, M_inv, bev_w, bev_h, state):
     histogram    = np.sum(binary, axis=0) / 255.0
     binary_color = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
-    return display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty
+    return display_frame, bev_with_lanes, binary_color, histogram
 
 
 def detect_obstacles(display_frame, yolo_model, roi_mask):
@@ -704,7 +703,7 @@ def detect_obstacles(display_frame, yolo_model, roi_mask):
 # ═══════════════════════════ Main ═══════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="GOLD-inspired lane detection on front-camera images.")
+    parser = argparse.ArgumentParser(description="Lane detection on front-camera images.")
     parser.add_argument("path", type=str,
                         help="Search path of the directory containing the images to be processed")
     args = parser.parse_args()
@@ -733,8 +732,7 @@ def main():
     print("Loading YOLOv8 nano model...")
     yolo_model = YOLO("yolov8n.pt")
 
-
-    # Create an image mask representing our drivable region of interest
+    # Create an image mask representing our drivable ROI 
     h, w = IMAGE_SIZE[1], IMAGE_SIZE[0]
     roi_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(roi_mask, [roi_polygon.reshape((-1, 1, 2))], 255)
@@ -745,7 +743,7 @@ def main():
             print(f"Warning: Could not read image {img_path}")
             continue
 
-        display_frame, bev_with_lanes, binary_color, histogram, left_fitx, right_fitx, ploty = lane_finding_pipeline(
+        display_frame, bev_with_lanes, binary_color, histogram = lane_finding_pipeline(
             frame, M, M_inv, BEV_WIDTH, BEV_HEIGHT, state
         )
 
@@ -760,19 +758,15 @@ def main():
         cv2.rectangle(display_frame, (10, 10), (380, 175), (100, 100, 100), 2)
         font_leg = cv2.FONT_HERSHEY_SIMPLEX
         cv2.line(display_frame, (25, 40), (65, 40), (0, 0, 255), 4)
-        cv2.putText(display_frame, "ROI", (80, 48), font_leg, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, "ROI", (80, 48), font_leg, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.line(display_frame, (25, 75), (65, 75), (0, 255, 0), 4)
-        cv2.putText(display_frame, "Solid lane", (80, 83), font_leg, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, "Solid lane", (80, 83), font_leg, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.line(display_frame, (25, 110), (37, 110), (0, 255, 255), 4)
         cv2.line(display_frame, (42, 110), (54, 110), (0, 255, 255), 4)
         cv2.line(display_frame, (59, 110), (65, 110), (0, 255, 255), 4)
-        cv2.putText(display_frame, "Dashed lane", (80, 118), font_leg, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, "Dashed lane", (80, 118), font_leg, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.rectangle(display_frame, (25, 137), (65, 157), (0, 255, 0), -1)
-        cv2.putText(display_frame, "Lane area", (80, 153), font_leg, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, "Lane area", (80, 153), font_leg, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
         hist_img = draw_histogram(histogram, BEV_WIDTH, BEV_HEIGHT)
 
@@ -815,7 +809,7 @@ def main():
 
         cv2.imshow(window_name, resized)
 
-        key = cv2.waitKey(100) & 0xFF
+        key = cv2.waitKey(200) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
@@ -826,7 +820,7 @@ def main():
     print("Playback finished. Press any key to close the window.")
     try:
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) != -1.0:
-            cv2.waitKey(1000)
+            cv2.waitKey(0)
     except:
         pass
     cv2.destroyAllWindows()
