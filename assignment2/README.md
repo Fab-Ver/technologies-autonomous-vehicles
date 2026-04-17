@@ -1,5 +1,15 @@
 # Lane Detection
 
+## Project Contents
+
+The project folder contains the following files:
+
+* `run_gold.py`: The Python script containing the implemented algorithm.
+* `report.pdf`: A PDF file with a report describing the algorithm implemented.
+* `requirements.txt`: File containing all the package dependencies required.
+* `yolov8n.pt`: The YOLOv8 weights file used for object detection.
+* `README.md`: This README file.
+
 ## Prerequisites
 
 Before running the program, make sure you have Python 3 installed on your system. 
