@@ -1,10 +1,30 @@
 import argparse
 import glob
-import cv2
 import sys
 import os
-import numpy as np
-from ultralytics import YOLO
+
+missing_packages = []
+
+try:
+    import cv2
+except ImportError:
+    missing_packages.append("opencv-python")
+
+try:
+    import numpy as np
+except ImportError:
+    missing_packages.append("numpy")
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    missing_packages.append("ultralytics")
+
+if missing_packages:
+    print(f"Error: Missing dependencies: {', '.join(missing_packages)}")
+    print("Please install them by running the following command:")
+    print("pip install -r requirements.txt")
+    sys.exit(1)
 
 # Camera intrinsics and extrinsics
 IMAGE_SIZE      = np.array([1920, 1080])
@@ -809,7 +829,7 @@ def main():
 
         cv2.imshow(window_name, resized)
 
-        key = cv2.waitKey(200) & 0xFF
+        key = cv2.waitKey(100) & 0xFF
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
@@ -820,7 +840,7 @@ def main():
     print("Playback finished. Press any key to close the window.")
     try:
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) != -1.0:
-            cv2.waitKey(0)
+            cv2.waitKey(1000)
     except:
         pass
     cv2.destroyAllWindows()

@@ -67,9 +67,7 @@
 % --- Body ---
 
 \section{Objectives}
-The primary goal of this project is to develop and implement a robust lane detection pipeline in Python. The algorithm processes real images from the PandaSet dataset, specifically from the front camera. The system is designed to detect lane delimiters and display them on the images, providing a message when no lanes are found.
-
-The project addresses the following mandatory and optional requirements:
+The primary goal of this project is to develop and implement a robust lane detection pipeline in Python. The project addresses the following mandatory and optional requirements:
 \begin{itemize}
     \item \textbf{Mandatory Requirement:} Process a sequence of images to detect lane delimiters. Display the detected lanes as green lines over a bird's eye view, or print "No lanes found" if detection fails.
     \item \textbf{Optional Requirement 1:} Discriminate between continuous and dashed lane lines.
@@ -104,22 +102,22 @@ where $\mu_{\text{above}}$ and $\mu_{\text{below}}$ are the average intensities 
 \subsubsection{Feature Extraction and Lane Tracking}
 Throughout the pipeline, the left and right lane boundaries are treated as two independent entities. This phase handles their robust detection over time:
 
-\paragraph{Cold Start Search (Histogram and Sliding Windows)}
+\paragraph{Histogram and Sliding Windows}
 When no prior lane information is available, a column histogram of the lower half of the binary image identifies starting $x$-coordinates for the lines based on pixel intensity peaks. A sliding window technique then tracks the lane pixels upwards. The window horizontally re-centers as it moves if a minimum number of white pixels (\texttt{MINPIX}) are found inside.
 
 \paragraph{Polynomial Fitting and Temporal Tracking}
 Once sufficient pixels are gathered, a second-degree polynomial is fitted to each line. The mathematical model maps the vertical coordinate $y$ to the horizontal coordinate $x$:
 \begin{equation}
-    x(y) = A \cdot y^2 + B \cdot y + C
+    x(y) = c_2 \cdot y^2 + c_1 \cdot y + c_0
 \end{equation}
-where $A$, $B$, and $C$ are the fitted coefficients. The detected curves must pass strict geometric constraints. If a lane was successfully detected in the previous frame, the sliding window search is bypassed; instead, the algorithm searches strictly for pixels within a fixed margin (\texttt{PREV\_POLY\_MARGIN}) around the previous mathematical curve.
+where $c_2$, $c_1$, and $c_0$ are the fitted coefficients. The detected curves must pass strict geometric constraints. If a lane was successfully detected in the previous frame, the sliding window search is bypassed; instead, the algorithm searches strictly for pixels within a fixed margin (\texttt{PREV\_POLY\_MARGIN}) around the previous mathematical curve.
 
 \paragraph{Temporal Smoothing}
-To stabilize the overlays and bridge momentary gaps in detection, a state tracker (\texttt{LaneState}) caches recent valid detections. The final rendered polynomial coefficients are computed as a moving average over a history of $N$ previous frames:
+To stabilize the overlays and bridge momentary gaps in detection, a state tracker (\texttt{LaneState}) caches recent valid detections. Rather than a simple average, the final rendered polynomial coefficient vector $\mathbf{C} = [c_2, c_1, c_0]^T$ is computed using an exponentially weighted moving average over a history of $N$ previous frames. Recent frames are given exponentially higher weights to prioritize current road topology while resisting sudden noise:
 \begin{equation}
-    \hat{C} = \frac{1}{N} \sum_{i=0}^{N-1} C_{t-i}
+    \hat{\mathbf{C}} = \sum_{i=0}^{N-1} w_{i} \mathbf{C}_{t-i} \quad \text{where} \quad w_i = \frac{2^{N-1-i}}{\sum_{j=0}^{N-1} 2^j}
 \end{equation}
-This averaging provides a crucial low-pass filtering effect against flicker and noise. If no valid lane is found across frames, the system falls back safely, displaying a "No lanes found" message rather than drawing arbitrary curves.
+where $t$ represents the current frame. This weighted averaging provides a crucial low-pass filtering effect against flicker and noise. If no valid lane is found across frames, the system falls back safely, displaying a "No lanes found" message rather than drawing arbitrary curves.
 
 \subsection{Optional Requirement 1: Continuous vs. Dashed Lanes}
 To classify the type of lane delimiter, the pipeline analyzes the vertical distribution of pixels along the fitted polynomial. It extracts the binary pixel intensities aligned with the curve's path. By computing the ratio of white pixels (solid paint) to the total length of the line segment, the system determines the coverage proportion. If this coverage exceeds a defined constant (\texttt{SOLID\_COVERAGE\_THRESHOLD}), the line is classified as continuous; otherwise, it is registered as dashed. 
@@ -130,23 +128,23 @@ Once classified, this distinction is directly reflected in the final visualizati
 While the analytical processing occurs in the bird's eye view, presenting the result on the original perspective image provides better spatial context. This is achieved by using the inverse transformation matrix (\texttt{M\_inv}) calculated during the initial IPM phase. The mathematical points generating the fitted polynomials in the top-down view are projected back into original camera coordinates and drawn directly onto the user-facing frame.
 
 \subsection{Optional Requirement 3: Obstacle Detection}
-The system integrates a pre-trained YOLO object detection model to identify common vehicle classes. While the neural network processes the entire perspective frame to detect all present vehicles, plotting every single bounding box would heavily clutter the visualization. Therefore, the algorithm isolates and renders only the obstacles whose bounding boxes overlap with the defined drivable Region of Interest (ROI) mask. 
+The system uses a pre-trained YOLO model to detect vehicles. Although YOLO processes the entire image and identifies all objects in the frame, only those intersecting the Region of Interest (ROI) mask are plotted to avoid visual clutter.
 
-For these relevant vehicles, the approximate physical longitudinal distance $Z$ (in meters) is computationally estimated directly from the original image. Assuming a flat road model, pinhole camera projection equations are applied to the bounding box's lowest vertical coordinate $v$ (representing the contact point with the road):
+For these relevant vehicles, the approximate physical longitudinal distance $Z$ (in meters) is estimated directly from the original image. Assuming a flat road model, pinhole camera projection equations are applied to the bounding box's lowest vertical coordinate $v$ (representing the contact point with the road):
 \begin{equation}
     Z = \frac{f_y \cdot H_{cam}}{v - c_y}
 \end{equation}
-where $H_{cam}$ is the physical camera height from the ground ($1.66$ m), $f_y$ is the vertical focal length ($1970$ px), and $c_y$ is the vertical principal point ($483$ px) of the camera.
+where $H_{cam}$ is the physical camera height from the ground, $f_y$ is the vertical focal length, and $c_y$ is the vertical principal point of the camera.
 
 \section{Experiments}
 
 \subsection{Experimental Setup and Dataset}
 The lane detection algorithm was tested using real-world driving data from the PandaSet dataset. Specifically, the processing involved 39 distinct folders representing different driving sequences, with each sequence containing exactly 80 frames. The software environment was built using Python and relies on standard computer vision and numerical libraries, primarily OpenCV and NumPy, alongside the Ultralytics framework to handle the object detection model.
 
-During execution, the system receives a target directory path via the command line. It systematically loads the image frames one by one, processes them through the complete pipeline, and immediately presents the output to the user. The interface displays a combined dashboard of the execution, allowing real-time monitoring of the different processing views. For a complete and detailed guide on how to execute the code and reproduce the tests, the reader should refer to the provided \texttt{README.md} file.
+During execution, the algorithm presents a real-time combined dashboard to the user. This interface outputs four simultaneous views: the original image and the Bird's Eye View (BEV) with the detected lane lines overlaid, the intermediate binary image, and the column histogram. It is worth noting that while the displayed histogram represents the entire BEV area for visual completeness, the internal mathematical computation actually filters it spatially to ignore external noise. For a detailed guide on how to execute the code, refer to the provided \texttt{README.md} file.
 
 \subsection{Camera Parameters}
-Calculating the correct geometric transformations requires precise knowledge of the camera's characteristics and its mounting position on the vehicle. The following intrinsic and extrinsic parameters, provided by the assignment instructions, were used to configure the system:
+Calculating the correct geometric transformations requires precise knowledge of the camera's characteristics and its mounting position on the vehicle. The following intrinsic and extrinsic parameters, provided by the assignment, were used to configure the system:
 \begin{itemize}
     \item \textbf{Image Size:} $1920 \times 1080$ pixels
     \item \textbf{Focal Length:} $[1970, 1970]$
@@ -168,54 +166,54 @@ To ensure a structured analysis, this qualitative assessment focused on three ke
 \section{Results and Discussion}
 
 \subsection{Qualitative Results and Visualizations}
-To evaluate the pipeline's effectiveness across various real-world scenarios, visual outputs from the algorithm are presented below. The following figures illustrate the system's performance under different conditions, demonstrating its ability to handle both complete and partial lane geometries.
+To evaluate the pipeline's effectiveness across various real-world scenarios, visual outputs from the algorithm are presented below. \autoref{fig:res_twodashed} and \autoref{fig:res_mixed} illustrate the system's ability to accurately detect and classify both dashed and solid lane lines. When confronted with scenarios completely lacking visible lane markings, the system safely triggers its fallback without drawing erroneous lines, as shown in \autoref{fig:res_nolines}. Finally, \autoref{fig:res_single} demonstrates the algorithm's robustness in isolating and tracking a single lane line when partial geometry is present.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.70\textwidth]{../results/dashed.png}
-    \caption{Two dashed lines accurately detected (slightly curved road).}
+    \caption{Two dashed lines accurately detected (slightly curved road). Extracted from sequence \texttt{019}.}
     \label{fig:res_twodashed}
 \end{figure}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.70\textwidth]{../results/solid_dashed.png}
-    \caption{Dashed and solid lines.}
+    \caption{Dashed and solid lines successfully classified. Extracted from sequence \texttt{012}.}
     \label{fig:res_mixed}
 \end{figure}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.70\textwidth]{../results/no_lane.png}
-    \caption{No lines found (safe fallback triggered).}
+    \caption{No lines found (safe fallback triggered). Extracted from sequence \texttt{028}.}
     \label{fig:res_nolines}
 \end{figure}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.70\textwidth]{../results/one_lane.png}
-    \caption{Single lane line isolated and tracked.}
+    \caption{Single lane line isolated and tracked. Extracted from sequence \texttt{039}.}
     \label{fig:res_single}
 \end{figure}
 
 \subsection{Performance Analysis}
-Following the visual inspection across all 39 sequences, the algorithm performs exceptionally well on low-noise roads with well-defined painted markings, provided the Region of Interest (ROI) is not disturbed by external sources. Excellent tracking stability was particularly evident in sequences [INSERT\_GOOD\_FOLDERS\_HERE]. 
+Following the visual inspection across all sequences, the algorithm performs exceptionally well on low-noise roads with well-defined painted markings, provided the Region of Interest (ROI) is not disturbed by external sources. Excellent tracking stability was consistently observed in scenarios characterized by clear lighting, uniformly paved asphalt, and freshly painted lane delimiters, allowing the dynamic binarization and morphological filters to cleanly isolate the road semantics. Conversely, in visually noisier environments the pipeline generally maintains its baseline functionality but exhibits reduced tracking stability.
 
-The primary engineering challenge encountered during development was finding the optimal trade-off during parameter tuning. Specifically, it is difficult to determine morphological filter sizes and binarization tolerances that aggressively filter out maximum road noise without simultaneously erasing necessary lane information. Additionally, fixing the correct sliding window margin and minimum pixel thresholds required careful balancing: windows that are too large capture neighboring noise, while windows that are too small fail to track high-curvature bends.
+The primary challenge encountered during development was finding the optimal trade-off during parameter tuning. Specifically, it is difficult to determine morphological filter sizes and binarization tolerances that aggressively filter out maximum road noise without simultaneously erasing necessary lane information. Additionally, fixing the correct sliding window margin and minimum pixel thresholds required careful balancing: windows that are too large capture neighboring noise, while windows that are too small fail to track high-curvature bends.
 
 \subsection{Limitations and Failure Cases}
-Despite solid performance in ideal conditions, the system exposes some limitations in highly noisy contexts or complex road topologies. In scenes with heavy traffic, obstacles such as cars or bright bumpers are not completely removed by the binarization step, leaving white blobs in the binary mask. 
+Despite solid performance in ideal conditions, the system exposes some limitations in highly noisy contexts or complex road topologies. In scenes with heavy traffic, obstacles are not completely removed by the binarization step, leaving white blobs in the binary mask. 
 
-A frequent issue encountered is the "vanishing line" problem. Although still visible to the human eye, faded, worn, or partially degraded lane markings are sometimes aggressively filtered out by the cleaning processes, leaving the sliding window search with insufficient pixels (dropping below the \texttt{MINPIX} threshold) to fit a valid curve. Consequently, in heavily cluttered situations, the drawn lane line sometimes incorrectly "hooks" onto noise artifacts, such as sidewalk curbs or the contours of nearby vehicles, instead of the actual lane.
+Another frequent issue encountered is the \textit{vanishing line} problem. Although still visible to the human eye, faded, worn, or partially degraded lane markings are sometimes aggressively filtered out by the cleaning processes, leaving the sliding window search with insufficient pixels to fit a valid curve. Consequently, in heavily cluttered situations, the drawn lane line sometimes incorrectly "hooks" onto noise artifacts, such as sidewalk curbs or the contours of nearby vehicles, instead of the actual lane.
 
 From a structural standpoint, these failures can be attributed to two main vulnerabilities:
 \begin{itemize}
-    \item \textbf{Rigid Morphological Kernels:} The opening and closing operations rely on highly vertically-biased rectangular kernels (e.g., \texttt{(1, 30)} and \texttt{(3, 50)}). While this smoothly connects vertical lane segments, it heavily penalizes diagonal lines. During sharp curves or immediate lane-change maneuvers, the lane markings become increasingly horizontal in the bird's eye view and are subsequently eradicated by these tall morphological filters.
-    \item \textbf{Static Flat-Road Assumption:} The Inverse Perspective Mapping (IPM) matrix is pre-calculated once based on a fixed camera pitch of zero and assuming a perfectly flat road. During sudden accelerations, braking (pitch changes), or driving on hilly terrain, the physical scale of the bird's eye view becomes distorted. This distortion artificially changes the perceived lane width, causing the \texttt{is\_valid\_lane} validation function to falsely reject perfectly valid lane curves because the computed distance between them unexpectedly breaks the strict real-world width constraints.
+    \item \textbf{Rigid Morphological Kernels:} The opening and closing operations rely on highly vertically-biased rectangular kernels. While this smoothly connects vertical lane segments, it heavily penalizes diagonal lines. During sharp curves or immediate lane-change maneuvers, the lane markings become increasingly horizontal in the bird's eye view and are subsequently eradicated by these tall morphological filters.
+    \item \textbf{Static Flat-Road Assumption:} The Inverse Perspective Mapping (IPM) matrix is pre-calculated once based on a fixed camera pitch of zero and assuming a perfectly flat road. During sudden accelerations, braking, or driving on hilly terrain, the physical scale of the bird's eye view becomes distorted. This distortion artificially changes the perceived lane width, causing the \texttt{is\_valid\_lane} validation function to falsely reject perfectly valid lane curves because the computed distance between them unexpectedly breaks the strict real-world width constraints.
 \end{itemize}
 
 \subsection{Conclusion and Future Work}
-Overall, despite these limitations in challenging environments, the implemented pipeline achieved good overall performance and successfully satisfies the assignment objectives. The algorithm's success is deeply tied to the effectiveness of the noise filtering stages, proving that the GOLD-inspired differential edge filtering is highly effective when configured correctly. However, deeper, adaptive hyperparameter tuning could yield substantially better results in noisy contexts.
+Overall, despite these limitations in challenging environments, the implemented pipeline achieved good overall performance and successfully satisfies the assignment objectives. The algorithm's success is deeply tied to the effectiveness of the noise filtering stages. However, deeper, adaptive hyperparameter tuning could yield substantially better results in noisy contexts.
 
 To directly address the current vulnerabilities, brief future extensions should be considered. A highly effective improvement would involve leveraging the already integrated YOLO object detection model \textit{before} the lane finding pipeline begins. By creating a negative mask from the detected vehicle bounding boxes and subtracting it from the ROI, the pipeline could fundamentally eliminate dynamic obstacle noise before binarization.
 
