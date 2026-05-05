@@ -743,6 +743,7 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 600)
     cv2.moveWindow(window_name, 0, 0)
+    cv2.waitKey(1) 
     
     M, M_inv, roi_polygon = get_perspective_transformation() 
 
@@ -833,16 +834,9 @@ def main():
         if key == ord('q') or key == 27:
             print("Playback interrupted by user.")
             break
-        if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) == -1.0:
-            print("Window closed by user.")
-            break
 
-    print("Playback finished. Press any key to close the window.")
-    try:
-        if cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) != -1.0:
-            cv2.waitKey(1000)
-    except:
-        pass
+    print("Playback finished. Closing window...")
+    cv2.waitKey(1500)
     cv2.destroyAllWindows()
 
 
